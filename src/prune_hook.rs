@@ -11,10 +11,12 @@ use crate::{TABLE_RANGE_ENABLE_PRUNING, TABLE_RANGE_LOG_PRUNING_DEBUG};
 /// One load per top-level plan (regardless of partition count) proves the per-plan cache.
 static CACHE_LOADS: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(any(test, feature = "pg_test"))]
 pub fn cache_load_count() -> u64 {
     CACHE_LOADS.load(Ordering::Relaxed)
 }
 
+#[cfg(any(test, feature = "pg_test"))]
 pub fn reset_cache_load_count() {
     CACHE_LOADS.store(0, Ordering::Relaxed);
 }

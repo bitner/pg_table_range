@@ -78,21 +78,23 @@ EXPLAIN (COSTS OFF) SELECT * FROM places WHERE geom && ST_MakeEnvelope(0,0,10,10
 
 ## Performance
 
-The win is at **planning time** on wide trees, where the planner would otherwise build
-paths for every partition. On a 1000-partition table queried by a non-key column
-(`bench/planning_benchmark.sql`, PostgreSQL 18):
+The benefit is at **execution**: a selective predicate on a non-key column scans only the
+matching partition instead of every partition. On 100 partitions × 30k rows = 3M rows
+(`bench/planning_benchmark.sql`, PostgreSQL 18, warm):
 
-| | Planning time | Result |
-|---|---|---|
-| pruning off | ~210 ms | 50 rows |
-| pruning on  | ~100 ms | 50 rows |
+| | Total query time (plan + exec) |
+|---|---|
+| pruning off (scans all 100 partitions) | ~125 ms |
+| pruning on  (scans 1 partition)        | ~18 ms  |
 
-Pruning removes ~110 ms of child-path planning here. Note the absolute numbers are higher
-than they could be: because summaries are owned by a real index, PostgreSQL loads index
-metadata for every partition during planning (a flat overhead, ~85 ms on this bare
-1000-partition table — proportionally smaller when partitions already carry indexes).
+Pruning is **not** a free planning-time win: it adds a small per-plan overhead (loading
+summaries once, then evaluating each partition — single-digit to low-tens of ms on
+hundreds of partitions). It pays off when the partitions it eliminates are large enough
+that avoiding their scan outweighs that overhead — so it helps most on **large
+partitions with a selective non-key predicate**, and can be a slight net cost on tiny
+partitions. Use `table_range.enable_pruning` to measure both ways on your workload.
 
-Summaries themselves are loaded **once per plan** (not per partition); the
+Summaries are loaded **once per plan** (not per partition); the
 `e2e_per_plan_cache_loads_once_regardless_of_partitions` test asserts exactly one
 catalog load for a 64-partition query.
 
