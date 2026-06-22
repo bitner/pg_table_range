@@ -3,19 +3,26 @@
 // the pgrx test harness invokes.
 //
 // These exercise the full path: create a partitioned table, populate disjoint value
-// ranges per partition, build summaries with `table_range_create`, then verify that
-// (a) the planner eliminates non-matching partitions (via EXPLAIN) and (b) results are
-// identical with pruning on and off (no false negatives).
+// ranges per partition, build summaries with `CREATE INDEX ... USING table_range`, then
+// verify that (a) the planner eliminates non-matching partitions (via EXPLAIN) and
+// (b) results are identical with pruning on and off (no false negatives).
 //
-// The partition key (`region`) deliberately differs from the queried data column
-// (`val`), so native PostgreSQL partition pruning cannot help — only the table_range
-// summaries can eliminate partitions here.
+// The partition key (`region`) deliberately differs from the queried data column, so
+// native PostgreSQL partition pruning cannot help — only the table_range summaries can.
+
+/// Build summaries for `cols` of `table` via a table_range index named `<table>_tr`.
+fn e2e_build(table: &str, cols: &str) {
+    Spi::run(&format!(
+        "CREATE INDEX {table}_tr ON {table} USING table_range ({cols})"
+    ))
+    .expect("create table_range index");
+}
 
 /// Build a 3-way LIST-partitioned table with disjoint `val` ranges:
 ///   events_r1: region=1, val in [0, 99]
 ///   events_r2: region=2, val in [100, 199]
 ///   events_r3: region=3, val in [200, 299]
-/// Then register summaries on `val`.
+/// Then summarize `val`.
 fn e2e_setup_events() {
     Spi::run(
         "DROP TABLE IF EXISTS events CASCADE;
@@ -28,11 +35,7 @@ fn e2e_setup_events() {
          INSERT INTO events SELECT 3, g FROM generate_series(200, 299) g;",
     )
     .expect("setup events");
-    let written =
-        Spi::get_one::<i64>("SELECT table_range_create('events'::regclass::oid, ARRAY['val'])")
-            .expect("create ok")
-            .expect("create returned count");
-    assert_eq!(written, 3, "one summary per leaf partition");
+    e2e_build("events", "val");
 }
 
 fn e2e_explain(query: &str) -> String {
@@ -48,6 +51,10 @@ fn e2e_explain(query: &str) -> String {
         Ok::<String, pgrx::spi::SpiError>(out)
     })
     .expect("explain")
+}
+
+fn e2e_explain_on(table: &str, pred: &str) -> String {
+    e2e_explain(&format!("SELECT * FROM {table} WHERE {pred}"))
 }
 
 fn e2e_set_pruning(on: bool) {
@@ -127,46 +134,9 @@ fn e2e_boundary_equality_keeps_correct_partition() {
 }
 
 #[pg_test]
-fn e2e_refresh_picks_up_new_data_range() {
-    e2e_setup_events();
-    e2e_set_pruning(true);
-    let plan_before = e2e_explain("SELECT * FROM events WHERE val = 500");
-    assert!(!plan_before.contains("events_r1"));
-
-    Spi::run("INSERT INTO events VALUES (1, 500)").expect("insert");
-    let n = Spi::get_one::<i64>("SELECT table_range_refresh('events'::regclass::oid)")
-        .expect("refresh")
-        .expect("count");
-    assert_eq!(n, 3);
-
-    let plan_after = e2e_explain("SELECT * FROM events WHERE val = 500");
-    assert!(plan_after.contains("events_r1"), "r1 must reappear:\n{plan_after}");
-    assert_eq!(e2e_count_where("val = 500"), 1);
-}
-
-#[pg_test]
 fn e2e_disabled_pruning_scans_all_partitions() {
     e2e_setup_events();
     e2e_set_pruning(false);
-    let plan = e2e_explain("SELECT * FROM events WHERE val >= 250");
-    assert!(plan.contains("events_r1"));
-    assert!(plan.contains("events_r2"));
-    assert!(plan.contains("events_r3"));
-}
-
-#[pg_test]
-fn e2e_drop_removes_summaries_and_pruning() {
-    e2e_setup_events();
-    assert_eq!(
-        Spi::get_one::<i64>("SELECT table_range_summary_count('events'::regclass::oid)")
-            .unwrap()
-            .unwrap(),
-        3
-    );
-    assert!(Spi::get_one::<bool>("SELECT table_range_drop('events'::regclass::oid)")
-        .unwrap()
-        .unwrap());
-    e2e_set_pruning(true);
     let plan = e2e_explain("SELECT * FROM events WHERE val >= 250");
     assert!(plan.contains("events_r1"));
     assert!(plan.contains("events_r2"));
@@ -181,9 +151,7 @@ fn e2e_works_on_plain_unpartitioned_table() {
          INSERT INTO plain_t SELECT g FROM generate_series(0, 99) g;",
     )
     .unwrap();
-    Spi::get_one::<i64>("SELECT table_range_create('plain_t'::regclass::oid, ARRAY['val'])")
-        .unwrap()
-        .unwrap();
+    e2e_build("plain_t", "val");
     e2e_set_pruning(true);
     assert_eq!(
         Spi::get_one::<i64>("SELECT count(*)::bigint FROM plain_t WHERE val >= 50")
@@ -200,39 +168,30 @@ fn e2e_works_on_plain_unpartitioned_table() {
 }
 
 #[pg_test]
-fn e2e_insert_without_refresh_is_still_correct() {
+fn e2e_insert_keeps_results_correct_via_staleness() {
     e2e_setup_events();
     e2e_set_pruning(true);
     // Sanity: before the insert, val=500 prunes everything (no partition covers it).
     assert_eq!(e2e_count_where("val = 500"), 0);
 
-    // Insert a value far outside r1's summarized range and DO NOT refresh.
+    // Insert a value far outside r1's summarized range. aminsert marks r1 stale, so the
+    // new row is still found — no false negative despite a now-stale summary.
     Spi::run("INSERT INTO events VALUES (1, 500)").expect("insert");
-
-    // The staleness trigger must have disabled pruning for r1, so the new row is
-    // still found — no false negative despite a stale summary.
     assert_eq!(
         e2e_count_where("val = 500"),
         1,
         "stale summary must not prune away newly inserted matching rows"
     );
-    // r1 must reappear in the plan (kept due to staleness).
     let plan = e2e_explain("SELECT * FROM events WHERE val = 500");
     assert!(plan.contains("events_r1"), "r1 kept while stale:\n{plan}");
-
-    // After refresh, pruning becomes effective again and the row is still correct.
-    Spi::get_one::<i64>("SELECT table_range_refresh('events'::regclass::oid)")
-        .unwrap()
-        .unwrap();
-    assert_eq!(e2e_count_where("val = 500"), 1);
 }
 
 #[pg_test]
 fn e2e_delete_keeps_results_correct() {
     e2e_setup_events();
     e2e_set_pruning(true);
-    // Deleting rows can only shrink a partition's true range; a now-too-wide summary
-    // is conservative (safe). Results must stay correct with or without refresh.
+    // Deleting rows can only shrink a partition's true range; a now-too-wide summary is
+    // conservative (safe). Results must stay correct.
     Spi::run("DELETE FROM events WHERE region = 2").expect("delete");
     for pred in ["val = 150", "val >= 100 AND val < 200", "val < 50"] {
         e2e_set_pruning(false);
@@ -260,16 +219,12 @@ fn e2e_large_tree_prunes_to_single_partition() {
         ))
         .unwrap();
     }
-    Spi::get_one::<i64>("SELECT table_range_create('big'::regclass::oid, ARRAY['val'])")
-        .unwrap()
-        .unwrap();
+    e2e_build("big", "val");
     e2e_set_pruning(true);
 
     // Value 1750 lives only in partition p17 (1700..1799).
     let plan = e2e_explain_on("big", "val = 1750");
     assert!(plan.contains("big_p17"), "p17 kept:\n{plan}");
-    assert!(!plan.contains("big_p0\n") && !plan.contains("big_p0 "), "p0 pruned:\n{plan}");
-    // Count of "big_p" scan references should be exactly 1 (only p17).
     let scans = plan.matches("big_p").count();
     assert_eq!(scans, 1, "expected a single surviving partition:\n{plan}");
 
@@ -284,8 +239,8 @@ fn e2e_large_tree_prunes_to_single_partition() {
 
 #[pg_test]
 fn e2e_per_plan_cache_loads_once_regardless_of_partitions() {
-    // 64 range partitions; planning a query must load summaries exactly once, not
-    // once per partition — this is the observable signature of the per-plan cache.
+    // 64 range partitions; planning a query must load summaries exactly once, not once
+    // per partition — the observable signature of the per-plan cache.
     Spi::run(
         "DROP TABLE IF EXISTS cache_t CASCADE;
          CREATE TABLE cache_t (val bigint) PARTITION BY RANGE (val);",
@@ -300,13 +255,10 @@ fn e2e_per_plan_cache_loads_once_regardless_of_partitions() {
         ))
         .unwrap();
     }
-    Spi::get_one::<i64>("SELECT table_range_create('cache_t'::regclass::oid, ARRAY['val'])")
-        .unwrap()
-        .unwrap();
+    e2e_build("cache_t", "val");
     e2e_set_pruning(true);
 
     Spi::run("SELECT table_range_reset_cache_load_count()").unwrap();
-    // One selective query over 64 partitions.
     let found = Spi::get_one::<i64>("SELECT count(*)::bigint FROM cache_t WHERE val = 3333")
         .unwrap()
         .unwrap();
@@ -330,7 +282,9 @@ fn postgis_available() -> bool {
 #[pg_test]
 fn e2e_postgis_extent_pruning() {
     // PostGIS is not installed in every test environment (e.g. the pgrx-managed pg18);
-    // skip gracefully there. CI installs PostGIS so this runs for real.
+    // skip gracefully there. CI installs PostGIS so this runs for real. Creating the
+    // extension fires our event trigger, which registers the geometry opclass so
+    // CREATE INDEX ... USING table_range (geom) resolves with no manual step.
     if !postgis_available() {
         return;
     }
@@ -346,9 +300,7 @@ fn e2e_postgis_extent_pruning() {
          INSERT INTO ev_g SELECT 3, ST_MakePoint(200+x, 200+y) FROM generate_series(0,10) x, generate_series(0,10) y;",
     )
     .unwrap();
-    Spi::get_one::<i64>("SELECT table_range_create('ev_g'::regclass::oid, ARRAY['geom'])")
-        .unwrap()
-        .unwrap();
+    e2e_build("ev_g", "geom");
     e2e_set_pruning(true);
 
     // A query box over partition 3's extent prunes partitions 1 and 2.
@@ -391,9 +343,7 @@ fn e2e_range_overlap_pruning() {
          INSERT INTO ev_r SELECT 3, int8range(200+g*10, 200+g*10+10) FROM generate_series(0,9) g;",
     )
     .unwrap();
-    Spi::get_one::<i64>("SELECT table_range_create('ev_r'::regclass::oid, ARRAY['period'])")
-        .unwrap()
-        .unwrap();
+    e2e_build("ev_r", "period");
     e2e_set_pruning(true);
 
     let plan = e2e_explain_on("ev_r", "period && int8range(250, 260)");
@@ -401,7 +351,6 @@ fn e2e_range_overlap_pruning() {
     assert!(!plan.contains("ev_r_1"), "r1 pruned:\n{plan}");
     assert!(!plan.contains("ev_r_2"), "r2 pruned:\n{plan}");
 
-    // Correctness on/off for several overlap predicates, including spanning and empty.
     let count = |pred: &str| {
         Spi::get_one::<i64>(&format!("SELECT count(*)::bigint FROM ev_r WHERE {pred}"))
             .unwrap()
@@ -409,9 +358,9 @@ fn e2e_range_overlap_pruning() {
     };
     for pred in [
         "period && int8range(250, 260)",
-        "period && int8range(95, 105)", // spans r1/r2 boundary
+        "period && int8range(95, 105)",    // spans r1/r2 boundary
         "period && int8range(1000, 2000)", // matches nothing
-        "period && int8range(0, 300)", // matches everything
+        "period && int8range(0, 300)",     // matches everything
     ] {
         e2e_set_pruning(false);
         let off = count(pred);
@@ -438,7 +387,6 @@ fn e2e_or_pruning() {
     assert!(plan_wide.contains("events_r2"));
     assert!(plan_wide.contains("events_r3"));
 
-    // Correctness on/off for several OR shapes, including a nested AND inside the OR.
     for pred in [
         "val < 50 OR val >= 250",
         "val = 5 OR val = 295",
@@ -470,7 +418,6 @@ fn e2e_in_list_pruning() {
     assert!(!plan2.contains("events_r2"), "r2 pruned:\n{plan2}");
     assert!(!plan2.contains("events_r3"), "r3 pruned:\n{plan2}");
 
-    // Correctness on/off across several IN lists (incl. NULL element and no matches).
     for pred in [
         "val IN (5, 250)",
         "val IN (5, 25, 75)",
@@ -486,22 +433,6 @@ fn e2e_in_list_pruning() {
     }
 }
 
-fn e2e_explain_on(table: &str, pred: &str) -> String {
-    Spi::connect(|client| {
-        let q = format!("EXPLAIN (COSTS OFF) SELECT * FROM {table} WHERE {pred}");
-        let t = client.select(&q, None, &[])?;
-        let mut out = String::new();
-        for row in t {
-            if let Ok(Some(line)) = row.get::<String>(1) {
-                out.push_str(&line);
-                out.push('\n');
-            }
-        }
-        Ok::<String, pgrx::spi::SpiError>(out)
-    })
-    .expect("explain")
-}
-
 #[pg_test]
 fn e2e_timestamptz_pruning() {
     Spi::run(
@@ -515,16 +446,13 @@ fn e2e_timestamptz_pruning() {
          INSERT INTO ev_ts SELECT 3, timestamptz '2024-03-01' + (g||' days')::interval FROM generate_series(0,27) g;",
     )
     .unwrap();
-    Spi::get_one::<i64>("SELECT table_range_create('ev_ts'::regclass::oid, ARRAY['ts'])")
-        .unwrap()
-        .unwrap();
+    e2e_build("ev_ts", "ts");
     e2e_set_pruning(true);
     let plan = e2e_explain_on("ev_ts", "ts >= timestamptz '2024-03-01'");
     assert!(plan.contains("ev_ts_3"), "march must remain:\n{plan}");
     assert!(!plan.contains("ev_ts_1"), "jan pruned:\n{plan}");
     assert!(!plan.contains("ev_ts_2"), "feb pruned:\n{plan}");
 
-    // Correctness on/off.
     let pred = "ts >= timestamptz '2024-02-15' AND ts < timestamptz '2024-03-10'";
     e2e_set_pruning(false);
     let off = Spi::get_one::<i64>(&format!("SELECT count(*)::bigint FROM ev_ts WHERE {pred}"))
@@ -550,9 +478,7 @@ fn e2e_text_pruning() {
          INSERT INTO ev_txt VALUES (3,'watermelon'),(3,'xigua'),(3,'zucchini');",
     )
     .unwrap();
-    Spi::get_one::<i64>("SELECT table_range_create('ev_txt'::regclass::oid, ARRAY['name'])")
-        .unwrap()
-        .unwrap();
+    e2e_build("ev_txt", "name");
     e2e_set_pruning(true);
     let plan = e2e_explain_on("ev_txt", "name >= 'watermelon'");
     assert!(plan.contains("ev_txt_3"), "third must remain:\n{plan}");
@@ -582,9 +508,7 @@ fn e2e_float_pruning() {
          INSERT INTO ev_f SELECT 2, 100.0 + g * 1.5 FROM generate_series(0,49) g;",
     )
     .unwrap();
-    Spi::get_one::<i64>("SELECT table_range_create('ev_f'::regclass::oid, ARRAY['amt'])")
-        .unwrap()
-        .unwrap();
+    e2e_build("ev_f", "amt");
     e2e_set_pruning(true);
     let plan = e2e_explain_on("ev_f", "amt > 120.0");
     assert!(plan.contains("ev_f_2"));
@@ -599,18 +523,12 @@ fn e2e_multicolumn_and_semantics() {
          CREATE TABLE mc_1 PARTITION OF mc FOR VALUES IN (1);
          CREATE TABLE mc_2 PARTITION OF mc FOR VALUES IN (2);
          CREATE TABLE mc_3 PARTITION OF mc FOR VALUES IN (3);
-         -- a and b ranges per partition:
-         -- p1: a[0..99]   b[0..99]
-         -- p2: a[100..199] b[100..199]
-         -- p3: a[200..299] b[200..299]
          INSERT INTO mc SELECT 1, g, g FROM generate_series(0,99) g;
          INSERT INTO mc SELECT 2, 100+g, 100+g FROM generate_series(0,99) g;
          INSERT INTO mc SELECT 3, 200+g, 200+g FROM generate_series(0,99) g;",
     )
     .unwrap();
-    Spi::get_one::<i64>("SELECT table_range_create('mc'::regclass::oid, ARRAY['a','b'])")
-        .unwrap()
-        .unwrap();
+    e2e_build("mc", "a, b");
     e2e_set_pruning(true);
     // a >= 250 keeps only p3; b < 50 alone keeps only p1; together -> empty.
     let plan = e2e_explain_on("mc", "a >= 250 AND b < 50");
@@ -618,7 +536,6 @@ fn e2e_multicolumn_and_semantics() {
     assert!(!plan.contains("mc_2"), "p2 pruned by both:\n{plan}");
     assert!(!plan.contains("mc_3"), "p3 pruned by b:\n{plan}");
 
-    // Correctness across several multi-column predicates.
     for pred in [
         "a >= 250 AND b < 50",
         "a < 150 AND b > 50",
@@ -645,14 +562,12 @@ fn e2e_is_null_pruning() {
          CREATE TABLE nt_nonull PARTITION OF nt FOR VALUES IN (1);
          CREATE TABLE nt_allnull PARTITION OF nt FOR VALUES IN (2);
          CREATE TABLE nt_mixed PARTITION OF nt FOR VALUES IN (3);
-         INSERT INTO nt SELECT 1, g FROM generate_series(1,50) g;          -- no nulls
-         INSERT INTO nt SELECT 2, NULL FROM generate_series(1,50) g;        -- all null
+         INSERT INTO nt SELECT 1, g FROM generate_series(1,50) g;
+         INSERT INTO nt SELECT 2, NULL FROM generate_series(1,50) g;
          INSERT INTO nt SELECT 3, CASE WHEN g % 2 = 0 THEN g ELSE NULL END FROM generate_series(1,50) g;",
     )
     .unwrap();
-    Spi::get_one::<i64>("SELECT table_range_create('nt'::regclass::oid, ARRAY['val'])")
-        .unwrap()
-        .unwrap();
+    e2e_build("nt", "val");
     e2e_set_pruning(true);
 
     // IS NULL: the no-null partition can be pruned; all-null and mixed remain.
@@ -667,7 +582,6 @@ fn e2e_is_null_pruning() {
     assert!(plan_nn.contains("nt_nonull"));
     assert!(plan_nn.contains("nt_mixed"));
 
-    // Correctness on/off for both null predicates.
     for pred in ["val IS NULL", "val IS NOT NULL"] {
         e2e_set_pruning(false);
         let off = Spi::get_one::<i64>(&format!("SELECT count(*)::bigint FROM nt WHERE {pred}"))

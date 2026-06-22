@@ -28,7 +28,7 @@ FROM generate_series(1, :part_count) g,
 
 ANALYZE bench_events;
 
-SELECT table_range_create('bench_events'::regclass::oid, ARRAY['val']);
+CREATE INDEX bench_events_tr ON bench_events USING table_range (val);
 
 \echo '==================== pruning OFF ===================='
 SET table_range.enable_pruning = off;
