@@ -1,4 +1,5 @@
 use pgrx::pg_sys;
+#[cfg(any(test, feature = "pg_test"))]
 use pgrx::prelude::*;
 
 // Low-level storage for a per-index summary, kept in the index's own metapage (block 0)
