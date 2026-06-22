@@ -1,0 +1,6 @@
+comment = 'Planning-time partition pruning by per-partition data ranges'
+default_version = '@CARGO_VERSION@'
+module_pathname = 'pg_table_range'
+relocatable = false
+superuser = true
+trusted = false

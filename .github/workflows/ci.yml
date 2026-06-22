@@ -1,0 +1,111 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  PGRX_VERSION: "0.18.1"
+
+jobs:
+  test:
+    name: test ${{ matrix.pg }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [pg16, pg17, pg18]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bison flex libreadline-dev zlib1g-dev \
+            libicu-dev pkg-config libclang-dev clang
+
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        run: rustup show
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ matrix.pg }}-${{ hashFiles('Cargo.toml') }}
+
+      - name: Cache pgrx-managed PostgreSQL
+        uses: actions/cache@v4
+        with:
+          path: ~/.pgrx
+          key: pgrx-${{ runner.os }}-${{ matrix.pg }}-${{ env.PGRX_VERSION }}
+
+      - name: Install cargo-pgrx
+        run: cargo install cargo-pgrx --version "=${{ env.PGRX_VERSION }}" --locked
+
+      - name: Initialize pgrx (build ${{ matrix.pg }} from source)
+        run: cargo pgrx init --${{ matrix.pg }} download
+
+      - name: Clippy (pg18 only; needs initialized pgrx)
+        if: matrix.pg == 'pg18'
+        run: |
+          rustup component add clippy
+          cargo clippy --no-default-features --features pg18,pg_test -- -D warnings
+
+      - name: Run tests
+        run: cargo pgrx test ${{ matrix.pg }}
+
+  postgis:
+    name: postgis (pg16)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PostgreSQL 16 + PostGIS + build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            postgresql-16 postgresql-server-dev-16 postgresql-16-postgis-3 \
+            build-essential libreadline-dev zlib1g-dev libicu-dev \
+            pkg-config libclang-dev clang
+          sudo systemctl stop postgresql || true
+
+      - name: Make the extension install dirs writable for pgrx
+        run: |
+          PGBIN=/usr/lib/postgresql/16/bin
+          sudo chmod -R a+w "$($PGBIN/pg_config --pkglibdir)" \
+                            "$($PGBIN/pg_config --sharedir)/extension"
+
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        run: rustup show
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-postgis-${{ hashFiles('Cargo.toml') }}
+
+      - name: Install cargo-pgrx
+        run: cargo install cargo-pgrx --version "=${{ env.PGRX_VERSION }}" --locked
+
+      - name: Point pgrx at the system PostgreSQL 16
+        run: cargo pgrx init --pg16 /usr/lib/postgresql/16/bin/pg_config
+
+      - name: Run tests (PostGIS available -> geometry test runs for real)
+        run: cargo pgrx test pg16
+
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup component add rustfmt
+      - run: cargo fmt --all --check

@@ -1,0 +1,12 @@
+# Rust / Cargo
+/target
+**/*.rs.bk
+Cargo.lock
+
+# Editors / OS
+.DS_Store
+.idea/
+*.iml
+
+# Project working notes (not part of the published extension)
+/PLAN.md

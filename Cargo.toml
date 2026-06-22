@@ -1,0 +1,35 @@
+[package]
+name = "pg_table_range"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "PostgreSQL extension for planning-time partition pruning by per-partition data ranges, including non-key columns."
+readme = "README.md"
+repository = "https://github.com/bitner/pg_table_range"
+keywords = ["postgresql", "pgrx", "partitioning", "pruning", "extension"]
+categories = ["database"]
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[features]
+default = ["pg18"]
+pg16 = ["pgrx/pg16", "pgrx-tests/pg16" ]
+pg17 = ["pgrx/pg17", "pgrx-tests/pg17" ]
+pg18 = ["pgrx/pg18", "pgrx-tests/pg18" ]
+pg_test = []
+
+[dependencies]
+pgrx = "=0.18.1"
+
+[dev-dependencies]
+pgrx-tests = "=0.18.1"
+
+[profile.dev]
+panic = "unwind"
+
+[profile.release]
+panic = "unwind"
+opt-level = 3
+lto = "fat"
+codegen-units = 1

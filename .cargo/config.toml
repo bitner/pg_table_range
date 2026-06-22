@@ -1,0 +1,12 @@
+# pgrx cdylib and test builds resolve PostgreSQL symbols at dlopen time, so the
+# linker must not reject the (intentionally) undefined PostgreSQL symbols at link
+# time.
+
+[target.'cfg(target_os = "macos")']
+rustflags = ["-Clink-arg=-Wl,-undefined,dynamic_lookup"]
+
+# Use the default linker and downgrade unresolved-symbol errors to warnings. Naming
+# the exact target triple also overrides any globally configured alternative linker
+# (e.g. mold) that cannot defer PostgreSQL symbol resolution to load time.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-Clinker=cc", "-Clink-arg=-Wl,--warn-unresolved-symbols"]
