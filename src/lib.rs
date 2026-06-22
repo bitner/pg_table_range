@@ -6,6 +6,7 @@ use pgrx::{GucContext, GucFlags, GucRegistry};
 ::pgrx::pg_module_magic!(name, version);
 
 mod index_am;
+mod index_storage;
 mod prune_hook;
 mod summary_build;
 

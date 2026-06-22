@@ -153,3 +153,19 @@ fn am_drop_index_cleans_summaries_and_stays_correct() {
         51
     );
 }
+
+#[pg_test]
+fn storage_page_roundtrip() {
+    Spi::run(
+        "DROP TABLE IF EXISTS pr CASCADE; CREATE TABLE pr (val bigint);
+         INSERT INTO pr VALUES (1);
+         CREATE INDEX pr_tr ON pr USING table_range (val);",
+    )
+    .unwrap();
+    let out = Spi::get_one::<String>(
+        "SELECT table_range_test_page_roundtrip('pr_tr'::regclass::oid, 'hello-page-42')",
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(out, "hello-page-42", "blob must round-trip through the index metapage");
+}
