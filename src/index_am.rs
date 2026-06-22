@@ -37,8 +37,8 @@ unsafe extern "C-unwind" fn xact_callback(
 // Instead, `ambuild` scans the (leaf) relation and writes one min/max/null summary per
 // indexed column into `table_range_summary` (keyed by the index OID), and installs
 // the staleness trigger that keeps the summary conservative on data changes. The planner
-// hook then prunes partitions exactly as it does for the function interface. The index is
-// never chosen for scans (no `amgettuple`/`amgetbitmap`, prohibitive cost estimate).
+// hook then prunes partitions using those summaries. The index is never chosen for scans
+// (no `amgettuple`/`amgetbitmap`, prohibitive cost estimate).
 
 /// V1 function-info record so PostgreSQL can call `table_range_amhandler` as a
 /// `LANGUAGE c` function declared in the access-method SQL below.
@@ -100,7 +100,7 @@ unsafe extern "C-unwind" fn am_build(
     pg_sys::PushActiveSnapshot(pg_sys::GetTransactionSnapshot());
     pgrx::PgTryBuilder::new(|| {
         if let Ok(names) = crate::summary_build::column_names_for_attnums(heap_relid, &attnums) {
-            let _ = crate::summary_build::build_one_leaf(index_relid, heap_relid, &names, false);
+            let _ = crate::summary_build::build_one_leaf(index_relid, heap_relid, &names);
         }
     })
     .catch_others(|_| ())
@@ -212,27 +212,69 @@ extension_sql!(
 
     CREATE ACCESS METHOD table_range TYPE INDEX HANDLER table_range_amhandler;
     COMMENT ON ACCESS METHOD table_range IS
-        'Conservative early partition pruning via min/max range summaries';
+        'Early partition pruning via per-partition data-range summaries';
 
-    -- Minimal default operator classes so CREATE INDEX ... USING table_range resolves a
-    -- class for each common column type. The AM stores only summaries, so these carry no
-    -- operators or support procedures (amvalidate accepts them).
-    CREATE OPERATOR CLASS bool_tr_ops    DEFAULT FOR TYPE boolean     USING table_range AS STORAGE boolean;
-    CREATE OPERATOR CLASS int2_tr_ops    DEFAULT FOR TYPE smallint    USING table_range AS STORAGE smallint;
-    CREATE OPERATOR CLASS int4_tr_ops    DEFAULT FOR TYPE integer     USING table_range AS STORAGE integer;
-    CREATE OPERATOR CLASS int8_tr_ops    DEFAULT FOR TYPE bigint      USING table_range AS STORAGE bigint;
-    CREATE OPERATOR CLASS float4_tr_ops  DEFAULT FOR TYPE real        USING table_range AS STORAGE real;
-    CREATE OPERATOR CLASS float8_tr_ops  DEFAULT FOR TYPE double precision USING table_range AS STORAGE double precision;
-    CREATE OPERATOR CLASS numeric_tr_ops DEFAULT FOR TYPE numeric     USING table_range AS STORAGE numeric;
-    CREATE OPERATOR CLASS text_tr_ops    DEFAULT FOR TYPE text        USING table_range AS STORAGE text;
-    CREATE OPERATOR CLASS varchar_tr_ops DEFAULT FOR TYPE varchar     USING table_range AS STORAGE varchar;
-    CREATE OPERATOR CLASS bpchar_tr_ops  DEFAULT FOR TYPE bpchar      USING table_range AS STORAGE bpchar;
-    CREATE OPERATOR CLASS date_tr_ops    DEFAULT FOR TYPE date        USING table_range AS STORAGE date;
-    CREATE OPERATOR CLASS time_tr_ops    DEFAULT FOR TYPE time        USING table_range AS STORAGE time;
-    CREATE OPERATOR CLASS timestamp_tr_ops   DEFAULT FOR TYPE timestamp   USING table_range AS STORAGE timestamp;
-    CREATE OPERATOR CLASS timestamptz_tr_ops DEFAULT FOR TYPE timestamptz USING table_range AS STORAGE timestamptz;
-    CREATE OPERATOR CLASS uuid_tr_ops    DEFAULT FOR TYPE uuid        USING table_range AS STORAGE uuid;
-    CREATE OPERATOR CLASS oid_tr_ops     DEFAULT FOR TYPE oid         USING table_range AS STORAGE oid;
+    -- CREATE INDEX ... USING table_range needs a default operator class for the column
+    -- type. Rather than hardcode a list, mirror the operator-class coverage that already
+    -- exists: any btree-ordered type (scalar min/max), every range type, and PostGIS
+    -- geometry/geography (extent). The AM stores only summaries, so these classes carry
+    -- no operators or support procedures. This runs at install and again whenever an
+    -- extension is created, so installing PostGIS makes geometry "just work" with no
+    -- manual step.
+    CREATE FUNCTION table_range_sync_opclasses() RETURNS void
+        LANGUAGE plpgsql AS $$
+        DECLARE
+            tr_am oid;
+            r record;
+        BEGIN
+            SELECT oid INTO tr_am FROM pg_am WHERE amname = 'table_range';
+            IF tr_am IS NULL THEN
+                RETURN;
+            END IF;
+            FOR r IN
+                SELECT DISTINCT cand.typid, format_type(cand.typid, NULL) AS typname
+                FROM (
+                    SELECT bc.opcintype AS typid
+                    FROM pg_opclass bc JOIN pg_am am ON am.oid = bc.opcmethod
+                    WHERE am.amname = 'btree' AND bc.opcdefault
+                    UNION
+                    SELECT t.oid FROM pg_type t WHERE t.typtype = 'r'
+                    UNION
+                    SELECT t.oid FROM pg_type t WHERE t.typname IN ('geometry', 'geography')
+                ) cand
+                WHERE cand.typid NOT IN ('anyrange'::regtype, 'anyarray'::regtype)
+                  AND NOT EXISTS (
+                      SELECT 1 FROM pg_opclass tc
+                      WHERE tc.opcmethod = tr_am AND tc.opcdefault
+                        AND tc.opcintype = cand.typid
+                  )
+            LOOP
+                BEGIN
+                    EXECUTE format(
+                        'CREATE OPERATOR CLASS %I DEFAULT FOR TYPE %s USING table_range AS STORAGE %s',
+                        'tr_' || r.typid, r.typname, r.typname);
+                EXCEPTION WHEN OTHERS THEN
+                    -- Skip types that cannot host a storage-only opclass.
+                    NULL;
+                END;
+            END LOOP;
+        END;
+        $$;
+
+    SELECT table_range_sync_opclasses();
+
+    CREATE FUNCTION table_range_opclass_sync_evt() RETURNS event_trigger
+        LANGUAGE plpgsql AS $$
+        BEGIN
+            PERFORM table_range_sync_opclasses();
+        END;
+        $$;
+
+    -- Re-sync when any extension is installed (e.g. PostGIS), so new types that gain a
+    -- btree/geometry opclass automatically become usable with table_range.
+    CREATE EVENT TRIGGER table_range_opclass_sync_trg
+        ON ddl_command_end WHEN TAG IN ('CREATE EXTENSION')
+        EXECUTE FUNCTION table_range_opclass_sync_evt();
     "#,
     name = "table_range_access_method",
     requires = ["table_range_bootstrap_sql"]

@@ -2,16 +2,14 @@ use pgrx::prelude::*;
 use pgrx::spi::SpiError;
 use std::sync::OnceLock;
 
-// Real, SPI-driven summary maintenance for the table_range pruning extension.
+// SPI-driven summary maintenance for the table_range pruning extension.
 //
-// Scans a registered parent relation's leaf partitions and persists one
-// per-(partition, column) min/max/null summary into `table_range_summary`.
-//
-// Summaries are keyed by:
-// - `index_oid` = the registered parent relation OID (synthetic key, no real index),
-// - `relid` = the leaf partition OID,
-// - `attnum` = the leaf partition's attnum for the column (resolved by name so
-//   differing physical column order across partitions is handled).
+// Summaries are built by the index access method's `ambuild` (see `index_am.rs`): for
+// each leaf partition it scans the column's real data and persists one summary row into
+// `table_range_summary`, keyed by:
+// - `index_oid` = the (leaf) index relation OID,
+// - `relid` = the leaf partition (heap) OID the planner sees,
+// - `attnum` = the leaf partition's attnum for the column.
 //
 // Correctness: a missing or `stale` summary means "do not prune". We never persist a
 // summary that could cause a false negative; on any failure we leave the partition
@@ -42,99 +40,6 @@ pub(crate) fn summary_table() -> String {
     format!("{}.table_range_summary", schema())
 }
 
-/// Schema-qualified name of the registration table.
-pub(crate) fn registered_table() -> String {
-    format!("{}.table_range_registered", schema())
-}
-
-/// Register a parent relation and build summaries for the named columns.
-#[pg_extern]
-fn table_range_create(parent: pg_sys::Oid, columns: Vec<String>) -> i64 {
-    if columns.is_empty() {
-        error!("table_range_create: at least one column is required");
-    }
-    validate_columns_exist(parent, &columns);
-
-    // Persist registration (idempotent).
-    let cols_literal = pg_array_text_literal(&columns);
-    let reg = format!(
-        "INSERT INTO table_range_registered (parent_relid, columns, refreshed_at) \
-         VALUES ({}::oid, {}, now()) \
-         ON CONFLICT (parent_relid) DO UPDATE SET columns = EXCLUDED.columns, refreshed_at = now()",
-        oid_u32(parent),
-        cols_literal
-    );
-    Spi::run(&reg).unwrap_or_else(|e| error!("table_range_create: failed to register parent: {e}"));
-
-    build_summaries(parent, &columns)
-        .unwrap_or_else(|e| error!("table_range_create: summary build failed: {e}"))
-}
-
-/// Recompute summaries for an already-registered parent relation.
-#[pg_extern]
-fn table_range_refresh(parent: pg_sys::Oid) -> i64 {
-    let columns = registered_columns(parent)
-        .unwrap_or_else(|e| error!("table_range_refresh: lookup failed: {e}"));
-    let columns = match columns {
-        Some(c) => c,
-        None => error!(
-            "table_range_refresh: parent {} is not registered",
-            oid_u32(parent)
-        ),
-    };
-    let written = build_summaries(parent, &columns)
-        .unwrap_or_else(|e| error!("table_range_refresh: summary build failed: {e}"));
-    Spi::run(&format!(
-        "UPDATE table_range_registered SET refreshed_at = now() WHERE parent_relid = {}::oid",
-        oid_u32(parent)
-    ))
-    .ok();
-    written
-}
-
-/// Unregister a parent relation, drop its summaries, and remove its triggers.
-#[pg_extern]
-fn table_range_drop(parent: pg_sys::Oid) -> bool {
-    // Remove staleness triggers from every leaf first (best-effort).
-    if let Ok(leaves) = leaf_partitions(parent) {
-        for leaf in leaves {
-            if let Ok(Some(name)) = relation_name(leaf) {
-                let _ = Spi::run(&format!(
-                    "DROP TRIGGER IF EXISTS {trg} ON {tbl}; \
-                     DROP TRIGGER IF EXISTS {trg}_trunc ON {tbl}",
-                    trg = STALE_TRIGGER_NAME,
-                    tbl = name
-                ));
-            }
-        }
-    }
-
-    let p = oid_u32(parent);
-    Spi::run(&format!(
-        "DELETE FROM {tbl} WHERE index_oid = {p}::oid",
-        tbl = summary_table()
-    ))
-    .and_then(|_| {
-        Spi::run(&format!(
-            "DELETE FROM table_range_registered WHERE parent_relid = {p}::oid"
-        ))
-    })
-    .is_ok()
-}
-
-/// Number of leaf partitions currently summarized for a parent.
-#[pg_extern]
-fn table_range_summary_count(parent: pg_sys::Oid) -> i64 {
-    Spi::get_one::<i64>(&format!(
-        "SELECT count(DISTINCT relid)::bigint FROM {tbl} WHERE index_oid = {p}::oid",
-        tbl = summary_table(),
-        p = oid_u32(parent)
-    ))
-    .ok()
-    .flatten()
-    .unwrap_or(0)
-}
-
 /// V1 record for the `sql_drop` event-trigger cleanup function.
 #[no_mangle]
 pub extern "C" fn pg_finfo_table_range_drop_cleanup() -> &'static pg_sys::Pg_finfo_record {
@@ -142,8 +47,8 @@ pub extern "C" fn pg_finfo_table_range_drop_cleanup() -> &'static pg_sys::Pg_fin
     &V1_API
 }
 
-/// Event-trigger handler: when any relation is dropped, remove the summaries and
-/// registration that referenced it. This closes the correctness gap where a dropped
+/// Event-trigger handler: when any relation is dropped, remove the summaries that
+/// referenced it (by index OID or leaf OID). This closes the gap where a dropped
 /// `table_range` index would leave summaries behind that nothing keeps stale anymore.
 #[no_mangle]
 #[pg_guard]
@@ -156,138 +61,23 @@ pub unsafe extern "C-unwind" fn table_range_drop_cleanup(
              WHERE s.index_oid = d.objid OR s.relid = d.objid",
             tbl = summary_table()
         ));
-        let _ = Spi::run(&format!(
-            "DELETE FROM {reg} r USING pg_event_trigger_dropped_objects() d \
-             WHERE r.parent_relid = d.objid",
-            reg = registered_table()
-        ));
     })
     .catch_others(|_| ())
     .execute();
     pg_sys::Datum::from(0)
 }
 
-fn validate_columns_exist(parent: pg_sys::Oid, columns: &[String]) {
-    for col in columns {
-        let found = Spi::get_one::<bool>(&format!(
-            "SELECT EXISTS (SELECT 1 FROM pg_attribute \
-             WHERE attrelid = {}::oid AND attname = {} AND attnum > 0 AND NOT attisdropped)",
-            oid_u32(parent),
-            quote_literal(col)
-        ))
-        .ok()
-        .flatten()
-        .unwrap_or(false);
-        if !found {
-            error!(
-                "table_range_create: column {:?} does not exist on relation {}",
-                col,
-                oid_u32(parent)
-            );
-        }
-    }
-}
-
-fn registered_columns(parent: pg_sys::Oid) -> Result<Option<Vec<String>>, SpiError> {
-    let mut out: Vec<String> = Vec::new();
-    let mut registered = false;
-    Spi::connect(|client| {
-        let table = client.select(
-            &format!(
-                "SELECT unnest(columns) AS c FROM table_range_registered WHERE parent_relid = {}::oid",
-                oid_u32(parent)
-            ),
-            None,
-            &[],
-        )?;
-        for row in table {
-            registered = true;
-            if let Ok(Some(c)) = row.get::<String>(1) {
-                out.push(c);
-            }
-        }
-        Ok::<(), SpiError>(())
-    })?;
-    if !registered {
-        Ok(None)
-    } else {
-        Ok(Some(out))
-    }
-}
-
-/// Enumerate leaf partitions of `parent`. For a non-partitioned table this returns
-/// the table itself, so summaries work for plain tables too.
-fn leaf_partitions(parent: pg_sys::Oid) -> Result<Vec<pg_sys::Oid>, SpiError> {
-    let mut leaves: Vec<pg_sys::Oid> = Vec::new();
-    Spi::connect(|client| {
-        let table = client.select(
-            &format!(
-                "SELECT relid::oid FROM pg_partition_tree({}::oid::regclass) WHERE isleaf",
-                oid_u32(parent)
-            ),
-            None,
-            &[],
-        )?;
-        for row in table {
-            if let Ok(Some(oid)) = row.get::<pg_sys::Oid>(1) {
-                leaves.push(oid);
-            }
-        }
-        Ok::<(), SpiError>(())
-    })?;
-    Ok(leaves)
-}
-
-/// Trigger name installed on each leaf to mark its summaries stale on data change.
-const STALE_TRIGGER_NAME: &str = "table_range_stale_trg";
-
-/// Install (idempotently) the staleness triggers on a leaf partition.
-///
-/// A row-level trigger is required for INSERT/UPDATE/DELETE because statement-level
-/// triggers on a leaf do not fire for tuples routed through the partitioned parent;
-/// row-level triggers do. TRUNCATE cannot be row-level, so it gets a statement
-/// trigger. Both mark only this leaf's summaries stale (precise, not global).
-fn install_stale_trigger(leaf_name: &str) -> Result<(), SpiError> {
-    Spi::run(&format!(
-        "DROP TRIGGER IF EXISTS {trg} ON {tbl}; \
-         CREATE TRIGGER {trg} AFTER INSERT OR UPDATE OR DELETE ON {tbl} \
-         FOR EACH ROW EXECUTE FUNCTION table_range_stale_trigger(); \
-         DROP TRIGGER IF EXISTS {trg}_trunc ON {tbl}; \
-         CREATE TRIGGER {trg}_trunc AFTER TRUNCATE ON {tbl} \
-         FOR EACH STATEMENT EXECUTE FUNCTION table_range_stale_trigger();",
-        trg = STALE_TRIGGER_NAME,
-        tbl = leaf_name
-    ))
-}
-
-/// Returns the number of summary rows written.
-fn build_summaries(parent: pg_sys::Oid, columns: &[String]) -> Result<i64, SpiError> {
-    let leaves = leaf_partitions(parent)?;
-    let mut written = 0i64;
-    for leaf in &leaves {
-        written += build_one_leaf(parent, *leaf, columns, true)?;
-    }
-    Ok(written)
-}
-
-/// Build summaries for a single leaf relation's named columns and install the
-/// correctness safety-net trigger on it. Used by both `table_range_create` (keyed by
-/// parent OID) and the index AM's `ambuild` (keyed by index OID). Returns the number
-/// of summary rows written.
+/// Build summaries for a single leaf relation's named columns. Called by `ambuild`
+/// (keyed by the index OID). Returns the number of summary rows written.
 pub(crate) fn build_one_leaf(
     index_oid: pg_sys::Oid,
     leaf: pg_sys::Oid,
     columns: &[String],
-    install_trigger: bool,
 ) -> Result<i64, SpiError> {
     let leaf_name = match relation_name(leaf)? {
         Some(n) => n,
         None => return Ok(0),
     };
-    // Ensure the correctness safety-net trigger exists before (re)building.
-    if install_trigger {
-        install_stale_trigger(&leaf_name)?;
-    }
 
     let mut written = 0i64;
     for col in columns {
@@ -439,7 +229,7 @@ pub(crate) fn column_names_for_attnums(
 
 #[allow(clippy::too_many_arguments)]
 fn upsert_summary(
-    parent: pg_sys::Oid,
+    index_oid: pg_sys::Oid,
     leaf: pg_sys::Oid,
     attnum: i16,
     kind: &str,
@@ -467,7 +257,7 @@ fn upsert_summary(
             stale = false, \
             tuple_version = s.tuple_version + 1",
         tbl = summary_table(),
-        p = oid_u32(parent),
+        p = oid_u32(index_oid),
         r = oid_u32(leaf),
         a = attnum,
         kind = quote_literal(kind),
@@ -501,13 +291,4 @@ fn quote_literal(s: &str) -> String {
 /// Minimal identifier quoting (always double-quote, escaping embedded quotes).
 fn quote_ident(s: &str) -> String {
     format!("\"{}\"", s.replace('"', "\"\""))
-}
-
-fn pg_array_text_literal(items: &[String]) -> String {
-    let inner = items
-        .iter()
-        .map(|s| quote_literal(s))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("ARRAY[{}]::text[]", inner)
 }
