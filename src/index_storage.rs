@@ -84,6 +84,173 @@ pub unsafe fn read_blob(index: pg_sys::Relation) -> Option<Vec<u8>> {
     result
 }
 
+// ---- typed summary (de)serialization ----------------------------------------------
+
+/// One column's summary, as stored in the index metapage and used by the planner.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ColSummary {
+    /// Heap attnum the summary is for (matched against `Var.varattno` at plan time).
+    pub attnum: i16,
+    /// `true` -> `min` holds a covering extent for `&&` pruning (range/geometry);
+    /// `false` -> `min`/`max` hold the column's btree min/max.
+    pub overlap: bool,
+    /// SQL type name (for casting in overlap evaluation).
+    pub type_name: String,
+    pub min: Option<String>,
+    pub max: Option<String>,
+    pub has_nulls: bool,
+    pub all_nulls: bool,
+}
+
+/// The whole index's summary: one entry per indexed column.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct IndexSummary {
+    pub cols: Vec<ColSummary>,
+}
+
+const SUMMARY_VERSION: u8 = 1;
+
+fn put_str(out: &mut Vec<u8>, s: &str) {
+    out.extend_from_slice(&(s.len() as u16).to_le_bytes());
+    out.extend_from_slice(s.as_bytes());
+}
+
+fn put_opt_str(out: &mut Vec<u8>, s: &Option<String>) {
+    match s {
+        Some(s) => {
+            out.push(1);
+            put_str(out, s);
+        }
+        None => out.push(0),
+    }
+}
+
+struct Reader<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl Reader<'_> {
+    fn u8(&mut self) -> Option<u8> {
+        let b = *self.buf.get(self.pos)?;
+        self.pos += 1;
+        Some(b)
+    }
+    fn u16(&mut self) -> Option<u16> {
+        let bytes = self.buf.get(self.pos..self.pos + 2)?;
+        self.pos += 2;
+        Some(u16::from_le_bytes([bytes[0], bytes[1]]))
+    }
+    fn i16(&mut self) -> Option<i16> {
+        self.u16().map(|v| v as i16)
+    }
+    fn str(&mut self) -> Option<String> {
+        let len = self.u16()? as usize;
+        let bytes = self.buf.get(self.pos..self.pos + len)?;
+        self.pos += len;
+        String::from_utf8(bytes.to_vec()).ok()
+    }
+    fn opt_str(&mut self) -> Option<Option<String>> {
+        match self.u8()? {
+            0 => Some(None),
+            _ => Some(Some(self.str()?)),
+        }
+    }
+}
+
+pub fn serialize(summary: &IndexSummary) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.push(SUMMARY_VERSION);
+    out.extend_from_slice(&(summary.cols.len() as u16).to_le_bytes());
+    for c in &summary.cols {
+        out.extend_from_slice(&c.attnum.to_le_bytes());
+        out.push(c.overlap as u8);
+        out.push((c.has_nulls as u8) | ((c.all_nulls as u8) << 1));
+        put_str(&mut out, &c.type_name);
+        put_opt_str(&mut out, &c.min);
+        put_opt_str(&mut out, &c.max);
+    }
+    out
+}
+
+pub fn deserialize(buf: &[u8]) -> Option<IndexSummary> {
+    let mut r = Reader { buf, pos: 0 };
+    if r.u8()? != SUMMARY_VERSION {
+        return None;
+    }
+    let ncols = r.u16()? as usize;
+    let mut cols = Vec::with_capacity(ncols);
+    for _ in 0..ncols {
+        let attnum = r.i16()?;
+        let overlap = r.u8()? != 0;
+        let flags = r.u8()?;
+        let type_name = r.str()?;
+        let min = r.opt_str()?;
+        let max = r.opt_str()?;
+        cols.push(ColSummary {
+            attnum,
+            overlap,
+            type_name,
+            min,
+            max,
+            has_nulls: flags & 1 != 0,
+            all_nulls: flags & 2 != 0,
+        });
+    }
+    Some(IndexSummary { cols })
+}
+
+/// Persist the typed summary into the index metapage.
+pub unsafe fn write_summary(
+    index: pg_sys::Relation,
+    summary: &IndexSummary,
+) -> Result<(), &'static str> {
+    write_blob(index, &serialize(summary))
+}
+
+/// Read the typed summary from the index metapage, if present.
+pub unsafe fn read_summary(index: pg_sys::Relation) -> Option<IndexSummary> {
+    deserialize(&read_blob(index)?)
+}
+
+#[cfg(test)]
+mod serde_tests {
+    use super::*;
+
+    #[test]
+    fn summary_roundtrips() {
+        let s = IndexSummary {
+            cols: vec![
+                ColSummary {
+                    attnum: 2,
+                    overlap: false,
+                    type_name: "bigint".into(),
+                    min: Some("0".into()),
+                    max: Some("99".into()),
+                    has_nulls: true,
+                    all_nulls: false,
+                },
+                ColSummary {
+                    attnum: 3,
+                    overlap: true,
+                    type_name: "int8range".into(),
+                    min: Some("[0,100)".into()),
+                    max: None,
+                    has_nulls: false,
+                    all_nulls: false,
+                },
+            ],
+        };
+        assert_eq!(deserialize(&serialize(&s)), Some(s));
+    }
+
+    #[test]
+    fn rejects_garbage_and_wrong_version() {
+        assert_eq!(deserialize(&[]), None);
+        assert_eq!(deserialize(&[99, 0, 0]), None);
+    }
+}
+
 // ---- test-only round-trip harness -------------------------------------------------
 
 #[cfg(any(test, feature = "pg_test"))]
