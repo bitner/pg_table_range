@@ -1,3 +1,5 @@
+# *** Experimental - very AI driven at this point in time. ***
+
 # pg_table_range: PostgreSQL data-range partition pruning
 
 A PostgreSQL 16+ extension that prunes partitions at planning time from a compact
