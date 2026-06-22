@@ -25,9 +25,10 @@ CREATE INDEX events_tr ON events USING table_range (val, created_at);
 -- Verify with EXPLAIN: non-matching partitions disappear from the plan.
 EXPLAIN (COSTS OFF) SELECT * FROM events WHERE val >= 250;
 
--- Recompute after heavy churn; or drop the summaries entirely.
+-- Inserts maintain the summary automatically; REINDEX only re-tightens after many
+-- deletes. DROP INDEX removes the summary with the index.
 REINDEX INDEX events_tr;
-DROP INDEX events_tr;   -- removes the summaries it built
+DROP INDEX events_tr;
 ```
 
 The index is never used for scans — it exists only to build and own the summaries — so
@@ -49,17 +50,16 @@ EXPLAIN (COSTS OFF) SELECT * FROM places WHERE geom && ST_MakeEnvelope(0,0,10,10
 
 ## How it works
 
-- **Summaries.** For each leaf partition and indexed column, one row in
-  `table_range_summary` records the `has_nulls` / `all_nulls` flags plus either the
-  column's btree `min`/`max` (scalar columns) or a single covering **extent** — a covering
-  range for range types (`range_merge(range_agg(col))`) or the bounding box for PostGIS
-  geometry (`ST_Extent(col)`).
-- **Planning.** A `planner_hook` loads all non-stale summaries once per top-level plan
-  (a single query, cached for the duration of planning). A `set_rel_pathlist_hook` then
-  evaluates each partition's restriction clauses against its cached summary and calls
-  `mark_dummy_rel` on any partition that provably cannot match — eliminating it before
-  child paths are generated. Wide partition trees therefore do not pay a per-partition
-  lookup.
+- **Summaries live in the index.** Like BRIN, each leaf partition's summary is stored in
+  that partition's index — one record per indexed column on the index's **metapage**, not
+  in any side table. It holds the `has_nulls` / `all_nulls` flags plus either the column's
+  btree `min`/`max` (scalar columns) or a single covering **extent** — a covering range
+  for range types (`range_merge(range_agg(col))`) or the bounding box for PostGIS geometry
+  (`ST_Extent(col)`).
+- **Planning.** For each partition the planner builds, a `set_rel_pathlist_hook` reads the
+  summary from that partition's index (cached for the plan) and evaluates the partition's
+  restriction clauses against it, calling `mark_dummy_rel` on any partition that provably
+  cannot match — eliminating it before child paths are generated.
 - **Typed comparisons.** Min/max vs. constant comparisons use each column type's own
   btree compare function, so **any btree-comparable type works**: `bigint` / `int` /
   `smallint`, `numeric`, `real` / `double precision`, `text` / `varchar`, `date`,
@@ -69,12 +69,14 @@ EXPLAIN (COSTS OFF) SELECT * FROM places WHERE geom && ST_MakeEnvelope(0,0,10,10
   is pruned by testing the constant against the partition's stored extent with
   PostgreSQL's own `&&` operator — so a partition is eliminated when its extent cannot
   overlap the query.
-- **Automatic correctness.** An insert that extends a partition marks its summary
-  *stale* (via the index's `aminsert`), and stale summaries are never used for pruning —
-  so a change can never cause a missing row. Deletes only shrink a partition's true
-  range, so the summary stays conservatively wide and remains safe. `REINDEX` recomputes
-  and re-enables pruning after churn, and a `sql_drop` event trigger removes a dropped
-  index's (or table's) summaries.
+- **Incremental maintenance (no REINDEX).** `aminsert` widens the summary in place as
+  rows are inserted — the same way BRIN maintains its ranges. Because the summary only
+  ever needs to be over-inclusive, these updates need no MVCC: an insert within the
+  existing range writes nothing; one that extends it grows the min/max/extent. Pruning
+  therefore stays correct **and** active across inserts without any rebuild. Deletes only
+  shrink a partition's true range, leaving the summary conservatively wide (still safe);
+  `VACUUM`/`REINDEX` can re-tighten it for selectivity. `DROP INDEX` removes the summary
+  with the index's storage — there is no side table to clean up.
 
 ## Performance
 
@@ -119,20 +121,20 @@ Everything not listed is conservatively **kept** (never mispruned):
 - `table_range.enable_pruning` (default `on`) — master switch.
 - `table_range.log_pruning_debug` (default `off`) — log each prune decision.
 
-## Catalog
+## Storage
 
-- `table_range_summary` — one summary row per (index, leaf partition, column):
-  `index_oid`, `relid`, `attnum`, `kind` (`minmax` or `overlap`), `type_name`,
-  `min_summary`, `max_summary`, `has_nulls`, `all_nulls`, `stale`, `tuple_version`.
+There is no catalog table — each partition's summary lives on its `table_range` index's
+metapage (block 0), written by `ambuild` and updated in place by `aminsert`, like BRIN.
 
 ## Project layout
 
 | File | Responsibility |
 |------|----------------|
-| `src/lib.rs` | GUCs, `_PG_init`, catalog/bootstrap SQL, test wiring |
-| `src/summary_build.rs` | SPI summary build (scalar min/max + range/geometry extent) |
+| `src/lib.rs` | GUCs, `_PG_init`, test wiring |
+| `src/index_storage.rs` | per-index summary on the metapage: page I/O (Generic WAL) + (de)serialization |
+| `src/summary_build.rs` | build a leaf's summary by scanning its data (used by `ambuild`) |
 | `src/prune_hook.rs` | planner + pathlist hooks, per-plan cache, typed in-memory evaluation |
-| `src/index_am.rs` | `table_range` index access method + automatic operator-class provisioning |
+| `src/index_am.rs` | `table_range` index AM: build, incremental `aminsert` widening, opclass provisioning |
 | `src/e2e_tests.rs`, `src/index_am_tests.rs` | end-to-end tests |
 
 ## Building and testing
@@ -154,5 +156,6 @@ range-type tests, which exercise the same code path.
 
 - `NOT IN` / `<> ALL`, `NOT (...)`, expression predicates, and parameterized
   prepared-statement plans are kept rather than pruned.
-- Summaries are exact at build time; an insert that extends a partition marks it stale
-  (not pruned, but still correct) until the next `REINDEX`.
+- Inserts keep summaries current incrementally, but deletes only relax them (the summary
+  can stay wider than the live data until a `VACUUM`/`REINDEX` re-tightens it) — always
+  correct, just potentially less selective.

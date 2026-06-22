@@ -253,6 +253,31 @@ mod serde_tests {
 
 // ---- test-only round-trip harness -------------------------------------------------
 
+/// Read an index's metapage summary and render it for tests.
+#[cfg(any(test, feature = "pg_test"))]
+#[pg_extern]
+fn table_range_test_read_summary(index: pg_sys::Oid) -> String {
+    unsafe {
+        let rel = pg_sys::index_open(index, pg_sys::AccessShareLock as i32);
+        let s = read_summary(rel);
+        pg_sys::index_close(rel, pg_sys::AccessShareLock as i32);
+        match s {
+            None => "none".to_string(),
+            Some(s) => s
+                .cols
+                .iter()
+                .map(|c| {
+                    format!(
+                        "attnum={} overlap={} min={:?} max={:?} has_nulls={} all_nulls={}",
+                        c.attnum, c.overlap, c.min, c.max, c.has_nulls, c.all_nulls
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; "),
+        }
+    }
+}
+
 #[cfg(any(test, feature = "pg_test"))]
 #[pg_extern]
 fn table_range_test_page_roundtrip(index: pg_sys::Oid, payload: String) -> String {

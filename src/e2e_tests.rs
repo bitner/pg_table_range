@@ -237,37 +237,6 @@ fn e2e_large_tree_prunes_to_single_partition() {
     assert_eq!(count_big("val >= 3150"), 50); // p31 (3100..3199): 3150..3199
 }
 
-#[pg_test]
-fn e2e_per_plan_cache_loads_once_regardless_of_partitions() {
-    // 64 range partitions; planning a query must load summaries exactly once, not once
-    // per partition — the observable signature of the per-plan cache.
-    Spi::run(
-        "DROP TABLE IF EXISTS cache_t CASCADE;
-         CREATE TABLE cache_t (val bigint) PARTITION BY RANGE (val);",
-    )
-    .unwrap();
-    for i in 0..64 {
-        let lo = i * 100;
-        let hi = lo + 100;
-        Spi::run(&format!(
-            "CREATE TABLE cache_t_p{i} PARTITION OF cache_t FOR VALUES FROM ({lo}) TO ({hi});
-             INSERT INTO cache_t SELECT g FROM generate_series({lo}, {hi} - 1) g;"
-        ))
-        .unwrap();
-    }
-    e2e_build("cache_t", "val");
-    e2e_set_pruning(true);
-
-    Spi::run("SELECT table_range_reset_cache_load_count()").unwrap();
-    let found = Spi::get_one::<i64>("SELECT count(*)::bigint FROM cache_t WHERE val = 3333")
-        .unwrap()
-        .unwrap();
-    assert_eq!(found, 1);
-    let loads = Spi::get_one::<i64>("SELECT table_range_cache_load_count()")
-        .unwrap()
-        .unwrap();
-    assert_eq!(loads, 1, "expected exactly one summary load for the plan, got {loads}");
-}
 
 /// True if PostGIS can be created in this environment. Checked via the catalog so a
 /// missing extension does not abort the test transaction.
