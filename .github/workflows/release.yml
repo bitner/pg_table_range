@@ -1,0 +1,43 @@
+name: Release to PGXN
+
+# Publishes a release to the PostgreSQL Extension Network (https://pgxn.org) when a
+# version tag is pushed. Requires two repository secrets, from a PGXN Manager account
+# (https://manager.pgxn.org): PGXN_USERNAME and PGXN_PASSWORD.
+#
+# To cut a release:
+#   1. Bump "version" in Cargo.toml and META.json (keep them identical).
+#   2. Commit, then tag:  git tag v0.1.0 && git push origin v0.1.0
+# The tag (without its leading "v") must match the META.json version.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  release:
+    name: Bundle and release on PGXN
+    runs-on: ubuntu-latest
+    container: pgxn/pgxn-tools
+    env:
+      PGXN_USERNAME: ${{ secrets.PGXN_USERNAME }}
+      PGXN_PASSWORD: ${{ secrets.PGXN_PASSWORD }}
+    steps:
+      - name: Check out the release tag
+        uses: actions/checkout@v4
+
+      - name: Verify META.json version matches the tag
+        run: |
+          meta="$(sed -n 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' META.json | head -1)"
+          tag="${GITHUB_REF_NAME#v}"
+          echo "META.json version: '$meta' ; git tag: '$tag'"
+          if [ "$meta" != "$tag" ]; then
+            echo "::error::META.json version ($meta) does not match the tag ($tag)"
+            exit 1
+          fi
+
+      - name: Validate META.json and bundle the distribution
+        run: pgxn-bundle
+
+      - name: Release on PGXN
+        run: pgxn-release

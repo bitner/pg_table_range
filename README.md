@@ -2,6 +2,9 @@
 
 # pg_table_range: PostgreSQL data-range partition pruning
 
+[![PGXN version](https://badge.fury.io/pg/pg_table_range.svg)](https://pgxn.org/dist/pg_table_range/)
+[![CI](https://github.com/bitner/pg_table_range/actions/workflows/ci.yml/badge.svg)](https://github.com/bitner/pg_table_range/actions/workflows/ci.yml)
+
 A PostgreSQL 16+ extension that prunes partitions at planning time from a compact
 per-partition summary of each column's **actual data** — its min/max range for scalar
 columns, or its covering **extent** for range types and PostGIS geometry. This works on
@@ -25,6 +28,35 @@ without it.
 > restart) before creating the index or querying** — see
 > [Scaling and partition count](#scaling-and-partition-count) for sizing. This is a
 > PostgreSQL limit on wide non-key access, not specific to this extension.
+
+## Installation
+
+This is a [pgrx](https://github.com/pgcentralfoundation/pgrx) (Rust) extension, so it is
+built and installed with `cargo pgrx` rather than a PGXS `make`. You need a Rust toolchain
+and `cargo-pgrx` matching the pgrx version this release pins (currently **0.18.1**):
+
+```sh
+cargo install cargo-pgrx --version 0.18.1 --locked
+
+# In a checkout of the source (from git or a PGXN download), install into the PostgreSQL
+# that `pg_config` points at. Match the feature flag to your server's major version:
+cargo pgrx install --release                                   # PostgreSQL 18 (default)
+cargo pgrx install --release --no-default-features --features pg17   # PostgreSQL 17
+cargo pgrx install --release --no-default-features --features pg16   # PostgreSQL 16
+```
+
+Use `--pg-config /path/to/pg_config` to target a specific PostgreSQL install. Then, in
+each database that should use it:
+
+```sql
+CREATE EXTENSION pg_table_range;
+```
+
+Supported: PostgreSQL 16, 17, and 18.
+
+The distribution is also published on [PGXN](https://pgxn.org/dist/pg_table_range/). Note
+that `pgxn install` (which expects a PGXS Makefile) does **not** apply here; use
+`pgxn download pg_table_range`, unzip, and run `cargo pgrx install` as above.
 
 ## Quick Start
 
@@ -281,6 +313,29 @@ no-false-negative guarantee), including insert/delete/drop correctness paths. Th
 PostGIS geometry test skips automatically where PostGIS is not installed; CI installs
 PostGIS so it runs there, and overlap pruning is also covered on every target by the
 range-type tests, which exercise the same code path.
+
+## Releasing (maintainers)
+
+The distribution is published to [PGXN](https://pgxn.org). Releases are automated by
+`.github/workflows/release.yml`, which runs on any `v*` tag and uses the
+[`pgxn/pgxn-tools`](https://github.com/pgxn/pgxn-tools) image to validate `META.json`,
+bundle the source, and upload it. One-time setup: add two repository secrets,
+`PGXN_USERNAME` and `PGXN_PASSWORD`, from a [PGXN Manager](https://manager.pgxn.org)
+account.
+
+To cut a release:
+
+1. Bump the version in **`Cargo.toml`** and **`META.json`** (keep them identical; the
+   `.control` file's `default_version` is filled from `Cargo.toml` at build time).
+2. Commit, then tag and push — the tag without its leading `v` must equal the
+   `META.json` version:
+
+   ```sh
+   git tag v0.1.0 && git push origin v0.1.0
+   ```
+
+`META.json` describes the PGXN distribution; `PLAN.md` and `.github/` are excluded from
+the published tarball via `.gitattributes`.
 
 ## Limitations
 
