@@ -66,7 +66,13 @@ jobs:
       - name: Install cargo-pgrx
         run: |
           rustup show
-          cargo install cargo-pgrx --version "=${{ env.PGRX_VERSION }}" --locked
+          # The cache may already hold the cargo-pgrx binary; `cargo install` errors on an
+          # existing binary, so only (re)install when it is missing or the wrong version.
+          if cargo-pgrx --version 2>/dev/null | grep -qF "${PGRX_VERSION}"; then
+            echo "cargo-pgrx ${PGRX_VERSION} already present (restored from cache)"
+          else
+            cargo install cargo-pgrx --version "=${PGRX_VERSION}" --locked --force
+          fi
 
       - name: Build the extension for PostgreSQL ${{ matrix.pg }}
         run: |
