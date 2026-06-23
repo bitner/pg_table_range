@@ -3,23 +3,9 @@ use pgrx::prelude::*;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
-use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::index_storage::ColSummary;
 use crate::{TABLE_RANGE_ENABLE_PRUNING, TABLE_RANGE_LOG_PRUNING_DEBUG};
-
-/// Diagnostic: number of times summaries were actually loaded from the catalog.
-/// One load per top-level plan (regardless of partition count) proves the per-plan cache.
-static CACHE_LOADS: AtomicU64 = AtomicU64::new(0);
-
-#[cfg(any(test, feature = "pg_test"))]
-pub fn cache_load_count() -> u64 {
-    CACHE_LOADS.load(Ordering::Relaxed)
-}
-
-#[cfg(any(test, feature = "pg_test"))]
-pub fn reset_cache_load_count() {
-    CACHE_LOADS.store(0, Ordering::Relaxed);
-}
 
 // Real planner-time partition pruning via `set_rel_pathlist_hook`, with a per-plan
 // summary cache driven by `planner_hook`.
@@ -32,9 +18,8 @@ pub fn reset_cache_load_count() {
 // partition cannot contain a matching row, we call `mark_dummy_rel` so the planner
 // eliminates it before generating child paths.
 //
-// The cache is loaded once per top-level planner invocation (one SPI query for all
-// non-stale summaries) and discarded when that invocation finishes, so very wide
-// partition trees do not issue a summary lookup per partition.
+// Each partition's summary is read from its table_range index's metapage and cached for
+// the duration of one top-level planner invocation.
 
 extern "C" {
     fn mark_dummy_rel(rel: *mut pg_sys::RelOptInfo);
@@ -46,30 +31,54 @@ const BTORDER_PROC: u16 = 1;
 static mut PREV_PATHLIST_HOOK: pg_sys::set_rel_pathlist_hook_type = None;
 static mut PREV_PLANNER_HOOK: pg_sys::planner_hook_type = None;
 
-#[derive(Clone)]
-struct SummaryRow {
-    attnum: i16,
-    /// `true` when `min` holds a covering extent for `&&` pruning (range/geometry);
-    /// `false` when `min`/`max` hold the column's btree min/max.
-    is_overlap: bool,
-    /// SQL type name for the stored extent (overlap rows only).
-    type_name: Option<String>,
-    min: Option<String>,
-    max: Option<String>,
-    has_nulls: bool,
-    all_nulls: bool,
-}
-
-type SummaryMap = HashMap<u32, Vec<SummaryRow>>;
+/// Per-partition summaries read from each partition's index, cached for one planner
+/// invocation (keyed by partition relid). A relid present with an empty vec means
+/// "checked, no table_range index / no summary".
+type SummaryMap = HashMap<u32, Vec<ColSummary>>;
 
 thread_local! {
-    /// Cached non-stale summaries for the current planner invocation, keyed by relid.
-    /// `None` means "not loaded yet this plan".
-    static CACHE: RefCell<Option<SummaryMap>> = const { RefCell::new(None) };
+    /// Summaries read during the current planner invocation. Cleared per top-level plan.
+    static CACHE: RefCell<SummaryMap> = RefCell::new(HashMap::new());
+    /// The table_range access-method OID, resolved once per plan.
+    static AM_OID: Cell<Option<pg_sys::Oid>> = const { Cell::new(None) };
     /// Nesting depth of planner invocations (SPI during planning re-enters).
     static PLAN_DEPTH: Cell<u32> = const { Cell::new(0) };
-    /// Guards against re-entering pruning logic from the SPI we issue to load the cache.
+    /// Guards against re-entering pruning logic from the SPI overlap evaluation issues.
     static IN_HOOK: Cell<bool> = const { Cell::new(false) };
+    /// Per-plan memo of each column type's btree compare proc OID (the lookup is three
+    /// syscache hits, identical for every partition of a column, so we do it once).
+    static CMP_PROC_MEMO: RefCell<HashMap<u32, Option<pg_sys::Oid>>> = RefCell::new(HashMap::new());
+    /// Per-plan memo of parsed query constants, keyed by (type oid, text). The same
+    /// constant is otherwise re-rendered and re-parsed once per partition.
+    static CONST_MEMO: RefCell<HashMap<(u32, String), pg_sys::Datum>> = RefCell::new(HashMap::new());
+}
+
+/// Compare proc for `typ`, memoized for the current plan. See [`btree_cmp_proc`].
+unsafe fn cmp_proc_cached(typ: pg_sys::Oid) -> Option<pg_sys::Oid> {
+    let key: u32 = typ.into();
+    if let Some(v) = CMP_PROC_MEMO.with(|m| m.borrow().get(&key).copied()) {
+        return v;
+    }
+    let v = btree_cmp_proc(typ);
+    CMP_PROC_MEMO.with(|m| {
+        m.borrow_mut().insert(key, v);
+    });
+    v
+}
+
+/// Parse `text` to a Datum of `typ`, memoized for the current plan. The cached Datum is
+/// allocated in the planner's memory context (which outlives the plan) and the memo is
+/// cleared per top-level plan, so the pointer stays valid for its lifetime.
+unsafe fn const_datum_cached(typ: pg_sys::Oid, text: &str) -> Option<pg_sys::Datum> {
+    let key = (typ.into(), text.to_string());
+    if let Some(d) = CONST_MEMO.with(|m| m.borrow().get(&key).copied()) {
+        return Some(d);
+    }
+    let d = text_to_datum(typ, text)?;
+    CONST_MEMO.with(|m| {
+        m.borrow_mut().insert(key, d);
+    });
+    Some(d)
 }
 
 /// Install our planner and pathlist hooks, preserving any previously-registered hooks.
@@ -160,49 +169,68 @@ unsafe extern "C-unwind" fn table_range_pathlist_hook(
 }
 
 fn clear_cache() {
-    CACHE.with(|c| *c.borrow_mut() = None);
+    CACHE.with(|c| c.borrow_mut().clear());
+    AM_OID.with(|c| c.set(None));
+    CMP_PROC_MEMO.with(|c| c.borrow_mut().clear());
+    CONST_MEMO.with(|c| c.borrow_mut().clear());
 }
 
-/// Load all non-stale summaries once for this planner invocation.
-fn ensure_cache_loaded() {
-    if CACHE.with(|c| c.borrow().is_some()) {
+/// The table_range access-method OID, resolved once per planner invocation.
+unsafe fn table_range_am_oid() -> pg_sys::Oid {
+    if let Some(oid) = AM_OID.with(|c| c.get()) {
+        return oid;
+    }
+    let oid = pg_sys::get_am_oid(c"table_range".as_ptr(), true);
+    AM_OID.with(|c| c.set(Some(oid)));
+    oid
+}
+
+/// Read the partition's summary from its table_range index's metapage (the index is
+/// found in the relation's index list and is already locked by the planner). The result
+/// is cached for this plan. An empty vec means "no table_range index / no summary".
+unsafe fn load_summary(rel: *mut pg_sys::RelOptInfo, relid_u32: u32) {
+    if CACHE.with(|c| c.borrow().contains_key(&relid_u32)) {
         return;
     }
-    CACHE_LOADS.fetch_add(1, Ordering::Relaxed);
-    let mut map: SummaryMap = HashMap::new();
-    let sql = format!(
-        "SELECT relid, attnum, kind, type_name, min_summary, max_summary, has_nulls, all_nulls \
-         FROM {} WHERE NOT stale",
-        crate::summary_build::summary_table()
-    );
-    let _ = Spi::connect(|client| {
-        let table = client.select(&sql, None, &[])?;
-        for row in table {
-            let relid = row.get::<pg_sys::Oid>(1).ok().flatten();
-            let attnum = row.get::<i16>(2).ok().flatten();
-            if let (Some(relid), Some(attnum)) = (relid, attnum) {
-                let kind = row.get::<String>(3).ok().flatten();
-                let entry = SummaryRow {
-                    attnum,
-                    is_overlap: kind.as_deref() == Some("overlap"),
-                    type_name: row.get::<String>(4).ok().flatten(),
-                    min: row.get::<String>(5).ok().flatten(),
-                    max: row.get::<String>(6).ok().flatten(),
-                    has_nulls: row.get::<bool>(7).ok().flatten().unwrap_or(false),
-                    all_nulls: row.get::<bool>(8).ok().flatten().unwrap_or(false),
-                };
-                map.entry(relid.into()).or_default().push(entry);
-            }
-        }
-        Ok::<(), pgrx::spi::SpiError>(())
+    let cols = read_index_summary(rel);
+    CACHE.with(|c| {
+        c.borrow_mut().insert(relid_u32, cols);
     });
-    CACHE.with(|c| *c.borrow_mut() = Some(map));
+}
+
+// We rely on the planner having put the table_range index into `rel->indexlist`. The
+// planner only lists indexes with `indisvalid = true`, so a table_range index must be
+// valid for pruning to engage — if anything marks it invalid (e.g. an external
+// "hide indexes" DDL hook), `indexlist` omits it and we silently fall back to KEEP.
+unsafe fn read_index_summary(rel: *mut pg_sys::RelOptInfo) -> Vec<ColSummary> {
+    let am = table_range_am_oid();
+    if am == pg_sys::Oid::INVALID || (*rel).indexlist.is_null() {
+        return Vec::new();
+    }
+    let indexes = pgrx::PgList::<pg_sys::IndexOptInfo>::from_pg((*rel).indexlist);
+    for idx in indexes.iter_ptr() {
+        if idx.is_null() || (*idx).relam != am {
+            continue;
+        }
+        let irel = pg_sys::index_open((*idx).indexoid, pg_sys::AccessShareLock as i32);
+        // A partitioned (parent) index has no storage; only leaf indexes hold summaries.
+        let has_storage =
+            (*(*irel).rd_rel).relkind != pg_sys::RELKIND_PARTITIONED_INDEX as std::ffi::c_char;
+        let summary = if has_storage {
+            crate::index_storage::read_summary(irel)
+        } else {
+            None
+        };
+        pg_sys::index_close(irel, pg_sys::AccessShareLock as i32);
+        return summary.map(|s| s.cols).unwrap_or_default();
+    }
+    Vec::new()
 }
 
 /// Returns true iff some restriction clause proves the partition cannot match.
 unsafe fn evaluate_relation(rel: *mut pg_sys::RelOptInfo, relid: pg_sys::Oid) -> bool {
-    ensure_cache_loaded();
     let relid_u32: u32 = relid.into();
+    load_summary(rel, relid_u32);
 
     let restrictlist = (*rel).baserestrictinfo;
     if restrictlist.is_null() {
@@ -212,9 +240,9 @@ unsafe fn evaluate_relation(rel: *mut pg_sys::RelOptInfo, relid: pg_sys::Oid) ->
 
     CACHE.with(|c| {
         let borrow = c.borrow();
-        let rows = match borrow.as_ref().and_then(|m| m.get(&relid_u32)) {
-            Some(rows) => rows,
-            None => return false, // unregistered / no summaries -> never prune
+        let rows = match borrow.get(&relid_u32) {
+            Some(rows) if !rows.is_empty() => rows,
+            _ => return false, // no summary -> never prune
         };
 
         // Top-level restriction clauses are implicitly AND-ed: if any one clause proves
@@ -237,7 +265,7 @@ unsafe fn evaluate_relation(rel: *mut pg_sys::RelOptInfo, relid: pg_sys::Oid) ->
 ///   - `AND(xs)` prunes if **any** child prunes,
 ///   - `OR(xs)`  prunes only if **every** child prunes,
 ///   - `NOT(..)` and unknown shapes are conservative (do not prune).
-unsafe fn clause_proves_prune(node: *mut pg_sys::Node, rows: &[SummaryRow], depth: u32) -> bool {
+unsafe fn clause_proves_prune(node: *mut pg_sys::Node, rows: &[ColSummary], depth: u32) -> bool {
     if node.is_null() || depth > 32 {
         return false;
     }
@@ -308,7 +336,7 @@ impl QualSpec {
     }
 
     /// Evaluate whether this clause proves the partition cannot match.
-    unsafe fn proves_prune(&self, row: &SummaryRow) -> bool {
+    unsafe fn proves_prune(&self, row: &ColSummary) -> bool {
         match self {
             // Null flags are valid for both minmax and overlap summaries.
             QualSpec::Null { is_null, .. } => {
@@ -325,19 +353,19 @@ impl QualSpec {
                 collation,
                 const_text,
                 ..
-            } => !row.is_overlap && eval_compare(row, *strategy, *typ, *collation, const_text),
+            } => !row.overlap && eval_compare(row, *strategy, *typ, *collation, const_text),
             QualSpec::InList {
                 typ,
                 collation,
                 elems,
                 ..
-            } => !row.is_overlap && eval_in_list(row, *typ, *collation, elems),
+            } => !row.overlap && eval_in_list(row, *typ, *collation, elems),
             // Overlap only applies to extent summaries.
             QualSpec::Overlap {
                 const_text,
                 const_type_name,
                 ..
-            } => row.is_overlap && eval_overlap(row, const_text, const_type_name),
+            } => row.overlap && eval_overlap(row, const_text, const_type_name),
         }
     }
 }
@@ -464,7 +492,7 @@ unsafe fn extract_saop(saop: *mut pg_sys::ScalarArrayOpExpr) -> Option<QualSpec>
 // ---------------------------------------------------------------------------------
 
 unsafe fn eval_compare(
-    row: &SummaryRow,
+    row: &ColSummary,
     strategy: i16,
     typ: pg_sys::Oid,
     collation: pg_sys::Oid,
@@ -474,11 +502,11 @@ unsafe fn eval_compare(
         (Some(min), Some(max)) => (min, max),
         _ => return false, // no usable range -> conservative KEEP
     };
-    let cmpproc = match btree_cmp_proc(typ) {
+    let cmpproc = match cmp_proc_cached(typ) {
         Some(p) => p,
         None => return false,
     };
-    let k = match text_to_datum(typ, const_text) {
+    let k = match const_datum_cached(typ, const_text) {
         Some(d) => d,
         None => return false,
     };
@@ -502,7 +530,7 @@ unsafe fn eval_compare(
 }
 
 unsafe fn eval_in_list(
-    row: &SummaryRow,
+    row: &ColSummary,
     typ: pg_sys::Oid,
     collation: pg_sys::Oid,
     elems: &[Option<String>],
@@ -511,7 +539,7 @@ unsafe fn eval_in_list(
         (Some(min), Some(max)) => (min, max),
         _ => return false,
     };
-    let cmpproc = match btree_cmp_proc(typ) {
+    let cmpproc = match cmp_proc_cached(typ) {
         Some(p) => p,
         None => return false,
     };
@@ -530,7 +558,7 @@ unsafe fn eval_in_list(
             Some(t) => t,
             None => continue, // NULL element never matches a value
         };
-        let d = match text_to_datum(typ, text) {
+        let d = match const_datum_cached(typ, text) {
             Some(d) => d,
             None => return false,
         };
@@ -547,15 +575,15 @@ unsafe fn eval_in_list(
 /// constant. The overlap test is delegated to PostgreSQL's own `&&` operator on the
 /// column's type (range types, PostGIS geometry), so it works wherever that operator
 /// is defined. A missing extent or any error is conservative (KEEP).
-unsafe fn eval_overlap(row: &SummaryRow, const_text: &str, const_type_name: &str) -> bool {
+unsafe fn eval_overlap(row: &ColSummary, const_text: &str, const_type_name: &str) -> bool {
     let extent = match &row.min {
         Some(e) => e,
         None => return false,
     };
-    let type_name = match &row.type_name {
-        Some(t) => t,
-        None => return false,
-    };
+    let type_name = &row.type_name;
+    if type_name.is_empty() {
+        return false;
+    }
     let sql = format!(
         "SELECT NOT (CAST({ext} AS {ext_t}) && CAST({k} AS {k_t}))",
         ext = sql_literal(extent),
@@ -586,7 +614,7 @@ unsafe fn operator_name(opno: pg_sys::Oid) -> Option<String> {
     name
 }
 
-unsafe fn datum_cmp(
+pub(crate) unsafe fn datum_cmp(
     cmpproc: pg_sys::Oid,
     collation: pg_sys::Oid,
     a: pg_sys::Datum,
@@ -596,7 +624,7 @@ unsafe fn datum_cmp(
 }
 
 /// Default btree "compare" support proc for a type, or `None` if unavailable.
-unsafe fn btree_cmp_proc(typ: pg_sys::Oid) -> Option<pg_sys::Oid> {
+pub(crate) unsafe fn btree_cmp_proc(typ: pg_sys::Oid) -> Option<pg_sys::Oid> {
     let opclass = pg_sys::GetDefaultOpClass(typ, pg_sys::BTREE_AM_OID);
     if opclass == pg_sys::Oid::INVALID {
         return None;
@@ -614,7 +642,7 @@ unsafe fn btree_cmp_proc(typ: pg_sys::Oid) -> Option<pg_sys::Oid> {
 }
 
 /// Convert text to a Datum of `typ` via the type's input function.
-unsafe fn text_to_datum(typ: pg_sys::Oid, s: &str) -> Option<pg_sys::Datum> {
+pub(crate) unsafe fn text_to_datum(typ: pg_sys::Oid, s: &str) -> Option<pg_sys::Datum> {
     let mut infunc = pg_sys::Oid::INVALID;
     let mut typioparam = pg_sys::Oid::INVALID;
     pg_sys::getTypeInputInfo(typ, &mut infunc, &mut typioparam);
@@ -627,7 +655,7 @@ unsafe fn text_to_datum(typ: pg_sys::Oid, s: &str) -> Option<pg_sys::Datum> {
 }
 
 /// Render a Datum of `typ` to its text representation via the type's output function.
-unsafe fn datum_to_text(typ: pg_sys::Oid, datum: pg_sys::Datum) -> Option<String> {
+pub(crate) unsafe fn datum_to_text(typ: pg_sys::Oid, datum: pg_sys::Datum) -> Option<String> {
     let mut outfunc = pg_sys::Oid::INVALID;
     let mut is_varlena = false;
     pg_sys::getTypeOutputInfo(typ, &mut outfunc, &mut is_varlena);

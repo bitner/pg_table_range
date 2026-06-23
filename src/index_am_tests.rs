@@ -37,13 +37,17 @@ fn am_create_index_builds_and_prunes() {
     am_setup();
     Spi::run("CREATE INDEX amt_tr ON amt USING table_range (val)").expect("create index");
 
-    // Summaries should exist for the three leaves.
-    let n = Spi::get_one::<i64>(
-        "SELECT count(DISTINCT relid)::bigint FROM table_range_summary",
+    // Each leaf index holds its summary on its own metapage. Check one leaf's page.
+    let leaf_summary = Spi::get_one::<String>(
+        "SELECT table_range_test_read_summary(i.inhrelid)
+         FROM pg_inherits i WHERE i.inhparent = 'amt_tr'::regclass LIMIT 1",
     )
     .unwrap()
     .unwrap();
-    assert!(n >= 3, "expected >=3 summarized leaves, got {n}");
+    assert!(
+        leaf_summary.contains("min=Some") && leaf_summary.contains("max=Some"),
+        "leaf index must carry a summary: {leaf_summary}"
+    );
 
     let plan = am_explain("amt", "val >= 250");
     assert!(plan.contains("amt_3"), "r3 kept:\n{plan}");
@@ -121,24 +125,17 @@ fn am_bulk_insert_stays_correct_under_stale_memo() {
 }
 
 #[pg_test]
-fn am_drop_index_cleans_summaries_and_stays_correct() {
+fn am_drop_index_stops_pruning_and_stays_correct() {
     am_setup();
     Spi::run("CREATE INDEX amt_tr ON amt USING table_range (val)").unwrap();
-    let before = Spi::get_one::<i64>("SELECT count(*)::bigint FROM table_range_summary")
-        .unwrap()
-        .unwrap();
-    assert!(before >= 3, "summaries built before drop: {before}");
-
-    Spi::run("DROP INDEX amt_tr").unwrap();
-
-    // The sql_drop event trigger must remove the index's summaries, so a later insert
-    // (no longer tracked by any index/trigger) cannot cause a stale-prune false negative.
-    let after = Spi::get_one::<i64>("SELECT count(*)::bigint FROM table_range_summary")
-        .unwrap()
-        .unwrap();
-    assert_eq!(after, 0, "summaries must be cleaned on DROP INDEX, found {after}");
-
     Spi::run("SET table_range.enable_pruning = on").unwrap();
+
+    // With the summary owned by the index, DROP INDEX removes it (the index's storage is
+    // gone) — no side table to clean up. Pruning simply stops; results stay correct.
+    Spi::run("DROP INDEX amt_tr").unwrap();
+    let plan = am_explain("amt", "val >= 250");
+    assert!(plan.contains("amt_1"), "no index -> no pruning:\n{plan}");
+
     Spi::run("INSERT INTO amt VALUES (1, 5000)").unwrap();
     assert_eq!(
         Spi::get_one::<i64>("SELECT count(*)::bigint FROM amt WHERE val = 5000")
@@ -151,5 +148,45 @@ fn am_drop_index_cleans_summaries_and_stays_correct() {
             .unwrap()
             .unwrap(),
         51
+    );
+}
+
+#[pg_test]
+fn storage_page_roundtrip() {
+    Spi::run(
+        "DROP TABLE IF EXISTS pr CASCADE; CREATE TABLE pr (val bigint);
+         INSERT INTO pr VALUES (1);
+         CREATE INDEX pr_tr ON pr USING table_range (val);",
+    )
+    .unwrap();
+    let out = Spi::get_one::<String>(
+        "SELECT table_range_test_page_roundtrip('pr_tr'::regclass::oid, 'hello-page-42')",
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(out, "hello-page-42", "blob must round-trip through the index metapage");
+}
+
+#[pg_test]
+fn ambuild_writes_summary_to_page() {
+    Spi::run(
+        "DROP TABLE IF EXISTS ap CASCADE;
+         CREATE TABLE ap (val bigint) PARTITION BY RANGE (val);
+         CREATE TABLE ap_1 PARTITION OF ap FOR VALUES FROM (0) TO (100);
+         INSERT INTO ap SELECT g FROM generate_series(0, 99) g;
+         CREATE INDEX ap_tr ON ap USING table_range (val);",
+    )
+    .unwrap();
+    // The per-partition summary lives on the leaf child index (on ap_1), not the
+    // partitioned parent. Find that child index and read its metapage summary.
+    let out = Spi::get_one::<String>(
+        "SELECT table_range_test_read_summary(i.inhrelid)
+         FROM pg_inherits i WHERE i.inhparent = 'ap_tr'::regclass",
+    )
+    .unwrap()
+    .unwrap();
+    assert!(
+        out.contains("min=Some(\"0\")") && out.contains("max=Some(\"99\")"),
+        "ambuild must persist the summary to the index page: {out}"
     );
 }
