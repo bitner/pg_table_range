@@ -162,6 +162,9 @@ jobs:
     needs: debian
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
+    # Gated on the protected `pgxn` environment: it holds the PGXN_USERNAME / PGXN_PASSWORD
+    # secrets, is restricted to v* tags, and requires manual approval before the upload runs.
+    environment: pgxn
     container: pgxn/pgxn-tools
     env:
       PGXN_USERNAME: ${{ secrets.PGXN_USERNAME }}
