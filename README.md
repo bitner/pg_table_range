@@ -10,6 +10,22 @@ cannot eliminate. Pruning is conservative: a partition is removed only when its 
 provably cannot contain a matching row, so results are always identical to running
 without it.
 
+> ### ⚠️ Many partitions? Raise `max_locks_per_transaction` first
+>
+> Pruning (and the index build) on a non-key column requires PostgreSQL to lock **every**
+> partition in one transaction. On the **default `max_locks_per_transaction = 64`** this
+> exhausts the lock table at roughly **a few thousand partitions**, with:
+>
+> ```
+> ERROR:  out of shared memory
+> HINT:   You might need to increase "max_locks_per_transaction".
+> ```
+>
+> If you have thousands of partitions, **raise `max_locks_per_transaction` (it requires a
+> restart) before creating the index or querying** — see
+> [Scaling and partition count](#scaling-and-partition-count) for sizing. This is a
+> PostgreSQL limit on wide non-key access, not specific to this extension.
+
 ## Quick Start
 
 Summaries are built and maintained through a custom index access method, so pruning
@@ -168,14 +184,38 @@ planner hook that prunes a non-key column before expansion, so this O(n) cost is
 
 Two practical consequences and how to handle them:
 
-- **Lock table exhaustion (a hard wall, ~10k partitions on defaults).** Any query touching
-  a non-key column must lock *every* partition (and its indexes) while planning. With the
-  default `max_locks_per_transaction = 64`, a query over ~10,000 partitions fails with
-  `ERROR: out of shared memory` / `You might need to increase "max_locks_per_transaction"`.
-  This is a PostgreSQL limit on wide non-key scans, not specific to this extension (native
-  key pruning avoids it by never locking pruned partitions). **Mitigation:** raise
-  `max_locks_per_transaction` (e.g. to a few thousand) and restart — it preallocates
-  shared memory for the lock table, pushing the wall out in proportion.
+- **Lock table exhaustion (the hard wall).** Two operations lock *every* partition (and its
+  indexes) in a single transaction:
+  - **`CREATE INDEX … USING table_range`**, which builds one child index per partition — so
+    on too many partitions the index can't even be *built* (it fails and rolls back, leaving
+    no summary, so queries then scan everything);
+  - **any query on a non-key column**, whose planning expands and locks all partitions.
+
+  On the default **`max_locks_per_transaction = 64`** the lock table holds only ~6,400 locks
+  (with default `max_connections = 100`), so at roughly **a few thousand partitions** — where
+  `2 × partitions` exceeds that — you get:
+
+  ```
+  ERROR:  out of shared memory
+  HINT:   You might need to increase "max_locks_per_transaction".
+  ```
+
+  This is a PostgreSQL limit on wide non-key access, not specific to this extension — native
+  key pruning avoids it by never locking pruned partitions.
+
+  **How to fix it.** Raise `max_locks_per_transaction`. It is a postmaster-level setting, so
+  it **requires a restart**:
+
+  ```sql
+  ALTER SYSTEM SET max_locks_per_transaction = 4096;   -- then restart PostgreSQL
+  ```
+
+  Sizing: the lock table holds about `max_locks_per_transaction × (max_connections +
+  max_prepared_transactions)` locks, and one statement over *N* partitions needs roughly
+  `2 × N` of them (a heap + an index lock per partition). Pick a value so that product
+  comfortably exceeds `2 × N` for your largest partitioned table, with headroom for
+  concurrency. With default `max_connections`, a few thousand (e.g. `4096`) covers tens of
+  thousands of partitions; each lock slot costs only a few hundred bytes of shared memory.
 - **Planning time grows with partition count.** Even below the lock wall, planning scales
   linearly — though the per-partition constant is now small (~3–4 µs warm, on par with
   `CHECK` constraint exclusion) thanks to the per-plan compilation and backend summary
@@ -244,11 +284,12 @@ range-type tests, which exercise the same code path.
 
 ## Limitations
 
-- **Planning is O(partitions)** for non-key predicates, with a hard lock-table wall around
-  ~10k partitions on default settings. See [Scaling](#scaling-and-partition-count) for the
-  cause and mitigations (`max_locks_per_transaction`, prepared statements, fewer/larger
-  partitions). Native partition-key pruning does not have this limit; table_range is for
-  the cases native pruning cannot handle.
+- **Lock-table wall on many partitions.** Both `CREATE INDEX … USING table_range` and
+  queries on a non-key column lock every partition at once, so on the default
+  `max_locks_per_transaction = 64` they fail (`out of shared memory`) at roughly a few
+  thousand partitions. **Raise `max_locks_per_transaction` (needs a restart)** — see
+  [Scaling](#scaling-and-partition-count) for sizing. Native partition-key pruning does not
+  have this limit; table_range is for the cases native pruning cannot handle.
 - Pruning is a **planning-time cost / execution-time win** tradeoff: on small partitions
   the per-plan overhead can exceed the scan it saves. Measure with
   `table_range.enable_pruning`.
