@@ -80,25 +80,80 @@ EXPLAIN (COSTS OFF) SELECT * FROM places WHERE geom && ST_MakeEnvelope(0,0,10,10
 
 ## Performance
 
-The benefit is at **execution**: a selective predicate on a non-key column scans only the
-matching partition instead of every partition. On 100 partitions × 30k rows = 3M rows
-(`bench/planning_benchmark.sql`, PostgreSQL 18, warm):
+The deal is simple and worth stating plainly: **table_range trades more planning time for
+much less execution time.** A selective predicate on a non-key column scans only the
+matching partition instead of every partition, which is a huge execution win — but the
+planner pays to evaluate each partition's summary, so planning gets slower.
 
-| | Total query time (plan + exec) |
-|---|---|
-| pruning off (scans all 100 partitions) | ~125 ms |
-| pruning on  (scans 1 partition)        | ~18 ms  |
+The numbers below are reproducible with `bench/benchmark.sql` (`cargo pgrx run pg18`, then
+`\i bench/benchmark.sql`); they report `EXPLAIN (ANALYZE)` planning and execution time
+separately, warm.
 
-Pruning is **not** a free planning-time win: it adds a small per-plan overhead (loading
-summaries once, then evaluating each partition — single-digit to low-tens of ms on
-hundreds of partitions). It pays off when the partitions it eliminates are large enough
-that avoiding their scan outweighs that overhead — so it helps most on **large
-partitions with a selective non-key predicate**, and can be a slight net cost on tiny
-partitions. Use `table_range.enable_pruning` to measure both ways on your workload.
+**Faster execution.** 300 partitions × 8,000 rows (2.4M rows), `WHERE nk = <value in one
+partition>`, PostgreSQL 18, warm:
 
-Summaries are loaded **once per plan** (not per partition); the
-`e2e_per_plan_cache_loads_once_regardless_of_partitions` test asserts exactly one
-catalog load for a 64-partition query.
+| | Planning | Execution | Total |
+|---|---|---|---|
+| pruning **off** (scans all 300 partitions) | ~3 ms | ~100 ms | ~103 ms |
+| pruning **on** (scans 1 partition) | ~12 ms | ~0.4 ms | **~12 ms** |
+
+Planning is ~4× slower, execution is ~230× faster, and total time drops ~8×. The win
+grows with how much data the eliminated partitions hold, and shrinks as partitions get
+smaller — on tiny partitions the planning overhead can exceed the execution it saves, so
+measure your workload with `table_range.enable_pruning`.
+
+**Honest comparison to native pruning.** When a predicate is on the *partition key*,
+PostgreSQL prunes natively — and that path is in a different league, because it eliminates
+partitions from a sorted bound array *before* they are ever locked or opened. The table
+below uses two identical columns on the same table: `pk` (the range partition key, pruned
+natively) and `nk` (the same values, not the key, pruned by table_range):
+
+| Same `=` predicate, 2,000 partitions | Planning | Execution |
+|---|---|---|
+| native pruning — column **is** the partition key | **~0.1 ms** | ~0.02 ms |
+| table_range — column is **not** the partition key | ~80 ms | ~0.06 ms |
+| no pruning — scans all 2,000 partitions | ~30 ms | ~26 ms |
+
+Native pruning is *hundreds of times* cheaper to plan and is effectively constant in the
+partition count. table_range cannot match that (see
+[Scaling](#scaling-and-partition-count)): its job is the case native pruning **can't** do
+— eliminating partitions by a non-key column. Against the realistic alternative for that
+case (scanning every partition), it still wins on total time whenever the partitions are
+sizeable.
+
+Each partition's summary is read from its own index page and cached for the duration of
+one plan; the per-column compare function and the query constant are resolved once per
+plan and reused across partitions (so the per-partition cost is a typed min/max compare,
+not repeated catalog lookups).
+
+## Scaling and partition count
+
+table_range's planning cost is **O(number of partitions)**: PostgreSQL builds a planner
+node for every partition of the table for a non-key predicate, and table_range evaluates
+each one's summary. This is fundamentally different from native partition pruning, which
+is ~O(log n) because it prunes on the partition key before expansion. There is no public
+planner hook that prunes a non-key column before expansion, so this O(n) cost is inherent.
+
+Two practical consequences and how to handle them:
+
+- **Lock table exhaustion (a hard wall, ~10k partitions on defaults).** Any query touching
+  a non-key column must lock *every* partition (and its indexes) while planning. With the
+  default `max_locks_per_transaction = 64`, a query over ~10,000 partitions fails with
+  `ERROR: out of shared memory` / `You might need to increase "max_locks_per_transaction"`.
+  This is a PostgreSQL limit on wide non-key scans, not specific to this extension (native
+  key pruning avoids it by never locking pruned partitions). **Mitigation:** raise
+  `max_locks_per_transaction` (e.g. to a few thousand) and restart — it preallocates
+  shared memory for the lock table, pushing the wall out in proportion.
+- **Planning time grows with partition count.** Even below the lock wall, planning scales
+  linearly. **Mitigations:** prefer **fewer, larger partitions** (table_range's sweet spot
+  — the execution win is biggest there anyway); use **prepared statements** so a plan is
+  reused across executions and the planning cost is amortized; and where you can,
+  **align the hot filter column with the partition key** so native pruning handles it.
+
+In short, table_range targets **hundreds to a few thousand sizeable partitions with a
+selective non-key predicate**. For tens of thousands of partitions, non-key pruning is not
+something an extension can make sub-linear today; that would require pre-expansion pruning
+support in PostgreSQL core.
 
 ## Supported predicates
 
@@ -154,8 +209,19 @@ range-type tests, which exercise the same code path.
 
 ## Limitations
 
+- **Planning is O(partitions)** for non-key predicates, with a hard lock-table wall around
+  ~10k partitions on default settings. See [Scaling](#scaling-and-partition-count) for the
+  cause and mitigations (`max_locks_per_transaction`, prepared statements, fewer/larger
+  partitions). Native partition-key pruning does not have this limit; table_range is for
+  the cases native pruning cannot handle.
+- Pruning is a **planning-time cost / execution-time win** tradeoff: on small partitions
+  the per-plan overhead can exceed the scan it saves. Measure with
+  `table_range.enable_pruning`.
 - `NOT IN` / `<> ALL`, `NOT (...)`, expression predicates, and parameterized
   prepared-statement plans are kept rather than pruned.
 - Inserts keep summaries current incrementally, but deletes only relax them (the summary
   can stay wider than the live data until a `VACUUM`/`REINDEX` re-tightens it) — always
   correct, just potentially less selective.
+- Pruning engages only while the index is **valid** (`indisvalid`); the planner ignores
+  invalid indexes, so anything that invalidates a table_range index silently disables its
+  pruning until rebuilt.
