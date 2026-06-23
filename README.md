@@ -121,6 +121,33 @@ partition count. table_range cannot match that (see
 case (scanning every partition), it still wins on total time whenever the partitions are
 sizeable.
 
+**Comparison to `CHECK` constraint exclusion.** The built-in way to prune on a non-key
+column is to put a data-range `CHECK (col BETWEEN lo AND hi)` on each partition and let the
+planner's constraint exclusion refute it. That is the most direct apples-to-apples
+baseline. Same table, 2,000 partitions, same `nk = <value>` predicate:
+
+| Same `=` predicate, 2,000 partitions | Planning | Execution | Scans |
+|---|---|---|---|
+| `CHECK` constraint exclusion (`constraint_exclusion=on`) | ~32 ms | ~0.08 ms | 1 partition |
+| table_range pruning | ~84 ms | ~0.08 ms | 1 partition |
+| no pruning | ~22 ms | ~24 ms | all 2,000 |
+
+Both are O(partitions) and give the **identical execution win**. Constraint exclusion plans
+~2.6× faster — it is C code testing an already-loaded `CHECK` expression (~5 µs/partition),
+while table_range reads each partition's index page (~31 µs/partition). What table_range
+buys for that extra planning cost is everything `CHECK` constraints make you give up:
+
+- **No manual management** — `CREATE INDEX` builds and owns the ranges; you don't compute
+  and attach a constraint per partition and keep it correct.
+- **No enforcement / no blocked inserts** — a real `CHECK` *rejects* out-of-range rows;
+  table_range's summary simply widens to cover new data, so inserts never fail.
+- **Incremental maintenance** — changing a `CHECK` means `DROP`/`ADD CONSTRAINT` with a
+  full-partition revalidation scan; table_range widens in place in `aminsert`, no rescan.
+
+So table_range offers constraint-exclusion-class pruning without manual, enforced,
+rescan-on-change constraints. Closing the ~2.6× planning gap (the per-partition index read)
+is an active optimization target.
+
 Each partition's summary is read from its own index page and cached for the duration of
 one plan; the per-column compare function and the query constant are resolved once per
 plan and reused across partitions (so the per-partition cost is a typed min/max compare,

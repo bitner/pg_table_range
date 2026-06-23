@@ -88,7 +88,46 @@ EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF) SELECT count(*) FROM bench_b WHERE nk =
 DROP TABLE bench_b CASCADE;
 
 -- ====================================================================================
--- 3. (Optional) The lock-table wall. At ~10,000 partitions a non-key predicate exhausts
+-- 3. table_range vs. CHECK constraint exclusion: the built-in way to prune on a non-key
+--    column is a data-range CHECK on each partition. Same table, same predicate; we toggle
+--    constraint_exclusion vs. table_range.enable_pruning to compare the two mechanisms.
+-- ====================================================================================
+DROP TABLE IF EXISTS bench_c CASCADE;
+CREATE TABLE bench_c (region int, nk bigint) PARTITION BY LIST (region);
+-- Each partition gets a data-driven CHECK on the non-key column nk.
+SELECT format(
+  'CREATE TABLE bench_c_%s PARTITION OF bench_c FOR VALUES IN (%s); '
+  'ALTER TABLE bench_c_%s ADD CONSTRAINT bench_c_%s_nk CHECK (nk >= %s AND nk <= %s);',
+  g, g, g, g, g * 1000, g * 1000 + 999)
+FROM generate_series(1, 2000) g \gexec
+INSERT INTO bench_c
+SELECT g, g * 1000 + s FROM generate_series(1, 2000) g, generate_series(0, 49) s;
+VACUUM ANALYZE bench_c;
+CREATE INDEX bench_c_tr ON bench_c USING table_range (nk);
+
+SET constraint_exclusion = on;
+SET table_range.enable_pruning = off;
+SELECT count(*) FROM bench_c WHERE nk = 1000025;  -- warm
+\echo '==== C: CHECK constraint exclusion (table_range off) ===='
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF) SELECT count(*) FROM bench_c WHERE nk = 1000025;
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF) SELECT count(*) FROM bench_c WHERE nk = 1000025;
+
+SET constraint_exclusion = off;
+SET table_range.enable_pruning = on;
+SELECT count(*) FROM bench_c WHERE nk = 1000025;  -- warm
+\echo '==== C: table_range pruning (CHECK exclusion off) ===='
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF) SELECT count(*) FROM bench_c WHERE nk = 1000025;
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF) SELECT count(*) FROM bench_c WHERE nk = 1000025;
+
+SET constraint_exclusion = off;
+SET table_range.enable_pruning = off;
+SELECT count(*) FROM bench_c WHERE nk = 1000025;  -- warm
+\echo '==== C: no pruning (both off, scans all 2,000 partitions) ===='
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF) SELECT count(*) FROM bench_c WHERE nk = 1000025;
+DROP TABLE bench_c CASCADE;
+
+-- ====================================================================================
+-- 4. (Optional) The lock-table wall. At ~10,000 partitions a non-key predicate exhausts
 --    the lock table on default settings:
 --      ERROR: out of shared memory
 --      HINT:  You might need to increase "max_locks_per_transaction".
