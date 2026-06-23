@@ -2,7 +2,7 @@
    "name": "pg_table_range",
    "abstract": "Planning-time partition pruning by per-partition data ranges, including non-key columns",
    "description": "pg_table_range prunes partitions at planning time from a compact per-partition summary of each column's actual data: its min/max range for btree-comparable scalar types, or a covering extent for range types and PostGIS geometry. Unlike native PostgreSQL partition pruning, it works on columns that are not the partition key. Summaries are stored in the index's own metapage and maintained incrementally on insert (like BRIN), so no REINDEX is needed, and pruning is conservative so results are always identical to running without it.",
-   "version": "0.1.0",
+   "version": "0.1.1",
    "maintainer": [
       "David Bitner <bitner@dbspatial.com>"
    ],
@@ -12,7 +12,7 @@
          "abstract": "Planning-time partition pruning by per-partition data ranges, including non-key columns",
          "file": "pg_table_range.control",
          "docfile": "README.md",
-         "version": "0.1.0"
+         "version": "0.1.1"
       }
    },
    "prereqs": {
@@ -47,5 +47,5 @@
       "postgis",
       "index access method"
    ],
-   "release_status": "testing"
+   "release_status": "stable"
 }

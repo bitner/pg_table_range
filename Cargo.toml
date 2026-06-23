@@ -1,6 +1,6 @@
 [package]
 name = "pg_table_range"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT"
 description = "PostgreSQL extension for planning-time partition pruning by per-partition data ranges, including non-key columns."
