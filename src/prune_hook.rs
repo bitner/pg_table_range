@@ -3,6 +3,7 @@ use pgrx::prelude::*;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
+use std::rc::Rc;
 
 use crate::index_storage::ColSummary;
 use crate::{TABLE_RANGE_ENABLE_PRUNING, TABLE_RANGE_LOG_PRUNING_DEBUG};
@@ -34,7 +35,7 @@ static mut PREV_PLANNER_HOOK: pg_sys::planner_hook_type = None;
 /// Per-partition summaries read from each partition's index, cached for one planner
 /// invocation (keyed by partition relid). A relid present with an empty vec means
 /// "checked, no table_range index / no summary".
-type SummaryMap = HashMap<u32, Vec<ColSummary>>;
+type SummaryMap = HashMap<u32, Rc<Vec<ColSummary>>>;
 
 thread_local! {
     /// Summaries read during the current planner invocation. Cleared per top-level plan.
@@ -51,6 +52,82 @@ thread_local! {
     /// Per-plan memo of parsed query constants, keyed by (type oid, text). The same
     /// constant is otherwise re-rendered and re-parsed once per partition.
     static CONST_MEMO: RefCell<HashMap<(u32, String), pg_sys::Datum>> = RefCell::new(HashMap::new());
+    /// Per-plan cache of resolved `FmgrInfo` structs (one palloc per function), so each
+    /// comparison / input-function call across partitions skips the `fmgr_info` syscache
+    /// lookup. Pointers are into the planner memory context and cleared per top-level plan.
+    static FMGR_MEMO: RefCell<HashMap<u32, *mut pg_sys::FmgrInfo>> = RefCell::new(HashMap::new());
+    /// Per-plan memo of a type's input function + ioparam (from `getTypeInputInfo`).
+    static INPUT_INFO_MEMO: RefCell<HashMap<u32, (pg_sys::Oid, pg_sys::Oid)>> =
+        RefCell::new(HashMap::new());
+    /// Per-plan memo of the btree strategy for an (operator, left type) pair.
+    static STRATEGY_MEMO: RefCell<HashMap<(u32, u32), Option<i16>>> = RefCell::new(HashMap::new());
+}
+
+/// A planner-cached `FmgrInfo` for `proc_oid`, valid for the current plan. Avoids the
+/// per-call `fmgr_info` syscache lookup that `OidFunctionCall*` does. Planner-only: the
+/// cache is cleared per top-level plan (the `aminsert` path must not use this).
+unsafe fn fmgr_cached(proc_oid: pg_sys::Oid) -> *mut pg_sys::FmgrInfo {
+    let key: u32 = proc_oid.into();
+    if let Some(p) = FMGR_MEMO.with(|m| m.borrow().get(&key).copied()) {
+        return p;
+    }
+    let p = pg_sys::palloc0(std::mem::size_of::<pg_sys::FmgrInfo>()) as *mut pg_sys::FmgrInfo;
+    pg_sys::fmgr_info(proc_oid, p);
+    FMGR_MEMO.with(|m| {
+        m.borrow_mut().insert(key, p);
+    });
+    p
+}
+
+/// Compare two datums of the same type using a plan-cached `FmgrInfo`. Planner-only.
+unsafe fn cmp_cached(
+    cmpproc: pg_sys::Oid,
+    collation: pg_sys::Oid,
+    a: pg_sys::Datum,
+    b: pg_sys::Datum,
+) -> i32 {
+    pg_sys::FunctionCall2Coll(fmgr_cached(cmpproc), collation, a, b).value() as i32
+}
+
+/// Parse `text` to a Datum of `typ` using plan-cached type-input info and `FmgrInfo`.
+/// Planner-only (clears per plan); the `aminsert` path uses [`text_to_datum`] instead.
+unsafe fn parse_cached(typ: pg_sys::Oid, text: &str) -> Option<pg_sys::Datum> {
+    let key: u32 = typ.into();
+    let (infunc, ioparam) = match INPUT_INFO_MEMO.with(|m| m.borrow().get(&key).copied()) {
+        Some(v) => v,
+        None => {
+            let mut infunc = pg_sys::Oid::INVALID;
+            let mut ioparam = pg_sys::Oid::INVALID;
+            pg_sys::getTypeInputInfo(typ, &mut infunc, &mut ioparam);
+            INPUT_INFO_MEMO.with(|m| {
+                m.borrow_mut().insert(key, (infunc, ioparam));
+            });
+            (infunc, ioparam)
+        }
+    };
+    if infunc == pg_sys::Oid::INVALID {
+        return None;
+    }
+    let cstr = CString::new(text).ok()?;
+    Some(pg_sys::InputFunctionCall(
+        fmgr_cached(infunc),
+        cstr.as_ptr() as *mut _,
+        ioparam,
+        -1,
+    ))
+}
+
+/// btree strategy for an (operator, left type) pair, memoized for the current plan.
+unsafe fn strategy_cached(opno: pg_sys::Oid, lefttype: pg_sys::Oid) -> Option<i16> {
+    let key = (opno.into(), lefttype.into());
+    if let Some(v) = STRATEGY_MEMO.with(|m| m.borrow().get(&key).copied()) {
+        return v;
+    }
+    let v = btree_strategy(opno, lefttype);
+    STRATEGY_MEMO.with(|m| {
+        m.borrow_mut().insert(key, v);
+    });
+    v
 }
 
 /// Compare proc for `typ`, memoized for the current plan. See [`btree_cmp_proc`].
@@ -74,7 +151,7 @@ unsafe fn const_datum_cached(typ: pg_sys::Oid, text: &str) -> Option<pg_sys::Dat
     if let Some(d) = CONST_MEMO.with(|m| m.borrow().get(&key).copied()) {
         return Some(d);
     }
-    let d = text_to_datum(typ, text)?;
+    let d = parse_cached(typ, text)?;
     CONST_MEMO.with(|m| {
         m.borrow_mut().insert(key, d);
     });
@@ -173,6 +250,11 @@ fn clear_cache() {
     AM_OID.with(|c| c.set(None));
     CMP_PROC_MEMO.with(|c| c.borrow_mut().clear());
     CONST_MEMO.with(|c| c.borrow_mut().clear());
+    // FmgrInfo structs are palloc'd in the planner context and freed when it resets; we
+    // just drop the (now-dangling-after-reset) pointers at the start/end of each plan.
+    FMGR_MEMO.with(|c| c.borrow_mut().clear());
+    INPUT_INFO_MEMO.with(|c| c.borrow_mut().clear());
+    STRATEGY_MEMO.with(|c| c.borrow_mut().clear());
 }
 
 /// The table_range access-method OID, resolved once per planner invocation.
@@ -198,21 +280,33 @@ unsafe fn load_summary(rel: *mut pg_sys::RelOptInfo, relid_u32: u32) {
     });
 }
 
+/// Empty shared summary returned when a relation has no usable table_range summary.
+fn empty_summary() -> Rc<Vec<ColSummary>> {
+    thread_local!(static EMPTY: Rc<Vec<ColSummary>> = Rc::new(Vec::new()));
+    EMPTY.with(Rc::clone)
+}
+
 // We rely on the planner having put the table_range index into `rel->indexlist`. The
 // planner only lists indexes with `indisvalid = true`, so a table_range index must be
 // valid for pruning to engage — if anything marks it invalid (e.g. an external
 // "hide indexes" DDL hook), `indexlist` omits it and we silently fall back to KEEP.
-unsafe fn read_index_summary(rel: *mut pg_sys::RelOptInfo) -> Vec<ColSummary> {
+unsafe fn read_index_summary(rel: *mut pg_sys::RelOptInfo) -> Rc<Vec<ColSummary>> {
     let am = table_range_am_oid();
     if am == pg_sys::Oid::INVALID || (*rel).indexlist.is_null() {
-        return Vec::new();
+        return empty_summary();
     }
     let indexes = pgrx::PgList::<pg_sys::IndexOptInfo>::from_pg((*rel).indexlist);
     for idx in indexes.iter_ptr() {
         if idx.is_null() || (*idx).relam != am {
             continue;
         }
-        let irel = pg_sys::index_open((*idx).indexoid, pg_sys::AccessShareLock as i32);
+        let indexoid = (*idx).indexoid;
+        // Warm path: a backend-lifetime cache lets repeated plans skip the index open and
+        // metapage read+deserialize entirely (kept coherent by a relcache callback).
+        if let Some(cached) = crate::summary_cache::get(indexoid) {
+            return cached;
+        }
+        let irel = pg_sys::index_open(indexoid, pg_sys::AccessShareLock as i32);
         // A partitioned (parent) index has no storage; only leaf indexes hold summaries.
         let has_storage =
             (*(*irel).rd_rel).relkind != pg_sys::RELKIND_PARTITIONED_INDEX as std::ffi::c_char;
@@ -222,9 +316,11 @@ unsafe fn read_index_summary(rel: *mut pg_sys::RelOptInfo) -> Vec<ColSummary> {
             None
         };
         pg_sys::index_close(irel, pg_sys::AccessShareLock as i32);
-        return summary.map(|s| s.cols).unwrap_or_default();
+        let cols = Rc::new(summary.map(|s| s.cols).unwrap_or_default());
+        crate::summary_cache::put(indexoid, Rc::clone(&cols));
+        return cols;
     }
-    Vec::new()
+    empty_summary()
 }
 
 /// Returns true iff some restriction clause proves the partition cannot match.
@@ -240,8 +336,8 @@ unsafe fn evaluate_relation(rel: *mut pg_sys::RelOptInfo, relid: pg_sys::Oid) ->
 
     CACHE.with(|c| {
         let borrow = c.borrow();
-        let rows = match borrow.get(&relid_u32) {
-            Some(rows) if !rows.is_empty() => rows,
+        let rows: &[ColSummary] = match borrow.get(&relid_u32) {
+            Some(rows) if !rows.is_empty() => rows.as_slice(),
             _ => return false, // no summary -> never prune
         };
 
@@ -404,7 +500,7 @@ unsafe fn extract_opexpr(opexpr: *mut pg_sys::OpExpr) -> Option<QualSpec> {
     }
 
     // Scalar btree comparison (`<`, `<=`, `=`, `>=`, `>`).
-    if let Some(strategy) = btree_strategy((*opexpr).opno, (*var).vartype) {
+    if let Some(strategy) = strategy_cached((*opexpr).opno, (*var).vartype) {
         let strategy = if commuted {
             commute_strategy(strategy)
         } else {
@@ -475,7 +571,7 @@ unsafe fn extract_saop(saop: *mut pg_sys::ScalarArrayOpExpr) -> Option<QualSpec>
         return None;
     }
     // Only the equality operator gives the "any element in range" semantics.
-    if btree_strategy((*saop).opno, (*var).vartype)? != 3 {
+    if strategy_cached((*saop).opno, (*var).vartype)? != 3 {
         return None;
     }
     let elems = array_const_texts(con)?;
@@ -510,15 +606,15 @@ unsafe fn eval_compare(
         Some(d) => d,
         None => return false,
     };
-    let min_d = match text_to_datum(typ, min) {
+    let min_d = match parse_cached(typ, min) {
         Some(d) => d,
         None => return false,
     };
-    let max_d = match text_to_datum(typ, max) {
+    let max_d = match parse_cached(typ, max) {
         Some(d) => d,
         None => return false,
     };
-    let cmp = |a, b| datum_cmp(cmpproc, collation, a, b);
+    let cmp = |a, b| cmp_cached(cmpproc, collation, a, b);
     match strategy {
         1 => cmp(min_d, k) >= 0,                     // col < K  : prune iff min >= K
         2 => cmp(min_d, k) > 0,                      // col <= K : prune iff min > K
@@ -543,11 +639,11 @@ unsafe fn eval_in_list(
         Some(p) => p,
         None => return false,
     };
-    let min_d = match text_to_datum(typ, min) {
+    let min_d = match parse_cached(typ, min) {
         Some(d) => d,
         None => return false,
     };
-    let max_d = match text_to_datum(typ, max) {
+    let max_d = match parse_cached(typ, max) {
         Some(d) => d,
         None => return false,
     };
@@ -562,8 +658,8 @@ unsafe fn eval_in_list(
             Some(d) => d,
             None => return false,
         };
-        if datum_cmp(cmpproc, collation, d, min_d) >= 0
-            && datum_cmp(cmpproc, collation, d, max_d) <= 0
+        if cmp_cached(cmpproc, collation, d, min_d) >= 0
+            && cmp_cached(cmpproc, collation, d, max_d) <= 0
         {
             return false; // this value is in range -> KEEP
         }

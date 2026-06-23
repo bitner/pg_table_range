@@ -57,9 +57,11 @@ EXPLAIN (COSTS OFF) SELECT * FROM places WHERE geom && ST_MakeEnvelope(0,0,10,10
   for range types (`range_merge(range_agg(col))`) or the bounding box for PostGIS geometry
   (`ST_Extent(col)`).
 - **Planning.** For each partition the planner builds, a `set_rel_pathlist_hook` reads the
-  summary from that partition's index (cached for the plan) and evaluates the partition's
-  restriction clauses against it, calling `mark_dummy_rel` on any partition that provably
-  cannot match — eliminating it before child paths are generated.
+  summary from that partition's index and evaluates the partition's restriction clauses
+  against it, calling `mark_dummy_rel` on any partition that provably cannot match —
+  eliminating it before child paths are generated. Deserialized summaries are cached for
+  the life of the backend (kept coherent by a relcache-invalidation callback), so warm
+  plans skip the per-partition page read; see [Performance](#performance).
 - **Typed comparisons.** Min/max vs. constant comparisons use each column type's own
   btree compare function, so **any btree-comparable type works**: `bigint` / `int` /
   `smallint`, `numeric`, `real` / `double precision`, `text` / `varchar`, `date`,
@@ -80,27 +82,26 @@ EXPLAIN (COSTS OFF) SELECT * FROM places WHERE geom && ST_MakeEnvelope(0,0,10,10
 
 ## Performance
 
-The deal is simple and worth stating plainly: **table_range trades more planning time for
-much less execution time.** A selective predicate on a non-key column scans only the
-matching partition instead of every partition, which is a huge execution win — but the
-planner pays to evaluate each partition's summary, so planning gets slower.
+**table_range trades a small amount of planning time for a large execution win.** A
+selective predicate on a non-key column scans only the matching partition instead of every
+partition. The planner pays a little to evaluate each partition's summary, but that cost is
+small and — warm — close to free (see the cache note below).
 
 The numbers below are reproducible with `bench/benchmark.sql` (`cargo pgrx run pg18`, then
 `\i bench/benchmark.sql`); they report `EXPLAIN (ANALYZE)` planning and execution time
-separately, warm.
+separately, warm, on PostgreSQL 18.
 
 **Faster execution.** 300 partitions × 8,000 rows (2.4M rows), `WHERE nk = <value in one
-partition>`, PostgreSQL 18, warm:
+partition>`:
 
 | | Planning | Execution | Total |
 |---|---|---|---|
-| pruning **off** (scans all 300 partitions) | ~3 ms | ~100 ms | ~103 ms |
-| pruning **on** (scans 1 partition) | ~12 ms | ~0.4 ms | **~12 ms** |
+| pruning **off** (scans all 300 partitions) | ~4 ms | ~110 ms | ~114 ms |
+| pruning **on** (scans 1 partition) | ~4 ms | ~0.4 ms | **~4 ms** |
 
-Planning is ~4× slower, execution is ~230× faster, and total time drops ~8×. The win
-grows with how much data the eliminated partitions hold, and shrinks as partitions get
-smaller — on tiny partitions the planning overhead can exceed the execution it saves, so
-measure your workload with `table_range.enable_pruning`.
+Execution is ~250× faster, total time drops ~25×, and warm the planning overhead is in the
+noise. The win grows with how much data the eliminated partitions hold; measure your
+workload with `table_range.enable_pruning`.
 
 **Honest comparison to native pruning.** When a predicate is on the *partition key*,
 PostgreSQL prunes natively — and that path is in a different league, because it eliminates
@@ -110,16 +111,15 @@ natively) and `nk` (the same values, not the key, pruned by table_range):
 
 | Same `=` predicate, 2,000 partitions | Planning | Execution |
 |---|---|---|
-| native pruning — column **is** the partition key | **~0.1 ms** | ~0.02 ms |
-| table_range — column is **not** the partition key | ~80 ms | ~0.06 ms |
-| no pruning — scans all 2,000 partitions | ~30 ms | ~26 ms |
+| native pruning — column **is** the partition key | **~0.15 ms** | ~0.05 ms |
+| table_range — column is **not** the partition key | ~34 ms | ~0.06 ms |
+| no pruning — scans all 2,000 partitions | ~28 ms | ~27 ms |
 
 Native pruning is *hundreds of times* cheaper to plan and is effectively constant in the
 partition count. table_range cannot match that (see
 [Scaling](#scaling-and-partition-count)): its job is the case native pruning **can't** do
-— eliminating partitions by a non-key column. Against the realistic alternative for that
-case (scanning every partition), it still wins on total time whenever the partitions are
-sizeable.
+— eliminating partitions by a non-key column. Note that table_range's overhead over the
+no-pruning baseline (~28 ms to expand 2,000 partitions) is now small (~6 ms, ~3 µs/part).
 
 **Comparison to `CHECK` constraint exclusion.** The built-in way to prune on a non-key
 column is to put a data-range `CHECK (col BETWEEN lo AND hi)` on each partition and let the
@@ -128,14 +128,15 @@ baseline. Same table, 2,000 partitions, same `nk = <value>` predicate:
 
 | Same `=` predicate, 2,000 partitions | Planning | Execution | Scans |
 |---|---|---|---|
-| `CHECK` constraint exclusion (`constraint_exclusion=on`) | ~32 ms | ~0.08 ms | 1 partition |
-| table_range pruning | ~84 ms | ~0.08 ms | 1 partition |
-| no pruning | ~22 ms | ~24 ms | all 2,000 |
+| `CHECK` constraint exclusion (`constraint_exclusion=on`) | ~37 ms | ~0.08 ms | 1 partition |
+| table_range pruning | ~34 ms | ~0.08 ms | 1 partition |
+| no pruning | ~26 ms | ~25 ms | all 2,000 |
 
-Both are O(partitions) and give the **identical execution win**. Constraint exclusion plans
-~2.6× faster — it is C code testing an already-loaded `CHECK` expression (~5 µs/partition),
-while table_range reads each partition's index page (~31 µs/partition). What table_range
-buys for that extra planning cost is everything `CHECK` constraints make you give up:
+Both are O(partitions) and give the **identical execution win**, and **table_range now
+plans on par with — and warm, slightly faster than — constraint exclusion.** (Constraint
+exclusion re-parses each partition's `CHECK` expression on every plan; table_range serves
+warm plans from a cached summary, see below.) On top of matching the speed, table_range
+avoids everything `CHECK` constraints make you give up:
 
 - **No manual management** — `CREATE INDEX` builds and owns the ranges; you don't compute
   and attach a constraint per partition and keep it correct.
@@ -144,14 +145,18 @@ buys for that extra planning cost is everything `CHECK` constraints make you giv
 - **Incremental maintenance** — changing a `CHECK` means `DROP`/`ADD CONSTRAINT` with a
   full-partition revalidation scan; table_range widens in place in `aminsert`, no rescan.
 
-So table_range offers constraint-exclusion-class pruning without manual, enforced,
-rescan-on-change constraints. Closing the ~2.6× planning gap (the per-partition index read)
-is an active optimization target.
+**How the per-partition cost got small.** Two optimizations took the per-partition planning
+cost from ~31 µs to ~3–4 µs:
 
-Each partition's summary is read from its own index page and cached for the duration of
-one plan; the per-column compare function and the query constant are resolved once per
-plan and reused across partitions (so the per-partition cost is a typed min/max compare,
-not repeated catalog lookups).
+1. *Per-plan compilation.* The compare function, type-input function, and operator strategy
+   are identical across a column's partitions, so they are resolved once per plan
+   (cached `FmgrInfo`s) instead of re-looked-up for each partition.
+2. *Backend summary cache.* Each index's deserialized summary is cached for the life of the
+   backend, so warm/repeated plans skip the per-partition index open and metapage
+   read+deserialize entirely. The cache is kept coherent by a relcache invalidation
+   callback: `aminsert` only ever *widens* a summary, and when it does it invalidates the
+   cached copy everywhere — so a cached summary is never narrower than reality (a wider one
+   prunes correctly). A cold first plan still reads each page; every plan after is cached.
 
 ## Scaling and partition count
 
@@ -172,10 +177,12 @@ Two practical consequences and how to handle them:
   `max_locks_per_transaction` (e.g. to a few thousand) and restart — it preallocates
   shared memory for the lock table, pushing the wall out in proportion.
 - **Planning time grows with partition count.** Even below the lock wall, planning scales
-  linearly. **Mitigations:** prefer **fewer, larger partitions** (table_range's sweet spot
-  — the execution win is biggest there anyway); use **prepared statements** so a plan is
-  reused across executions and the planning cost is amortized; and where you can,
-  **align the hot filter column with the partition key** so native pruning handles it.
+  linearly — though the per-partition constant is now small (~3–4 µs warm, on par with
+  `CHECK` constraint exclusion) thanks to the per-plan compilation and backend summary
+  cache described above. **Mitigations:** prefer **fewer, larger partitions** (table_range's
+  sweet spot — the execution win is biggest there anyway); use **prepared statements** so a
+  plan is reused across executions; and where you can, **align the hot filter column with
+  the partition key** so native pruning handles it.
 
 In short, table_range targets **hundreds to a few thousand sizeable partitions with a
 selective non-key predicate**. For tens of thousands of partitions, non-key pruning is not
@@ -215,7 +222,8 @@ metapage (block 0), written by `ambuild` and updated in place by `aminsert`, lik
 | `src/lib.rs` | GUCs, `_PG_init`, test wiring |
 | `src/index_storage.rs` | per-index summary on the metapage: page I/O (Generic WAL) + (de)serialization |
 | `src/summary_build.rs` | build a leaf's summary by scanning its data (used by `ambuild`) |
-| `src/prune_hook.rs` | planner + pathlist hooks, per-plan cache, typed in-memory evaluation |
+| `src/prune_hook.rs` | planner + pathlist hooks, per-plan compilation cache, typed in-memory evaluation |
+| `src/summary_cache.rs` | backend-lifetime per-index summary cache + relcache-invalidation coherence |
 | `src/index_am.rs` | `table_range` index AM: build, incremental `aminsert` widening, opclass provisioning |
 | `src/e2e_tests.rs`, `src/index_am_tests.rs` | end-to-end tests |
 
