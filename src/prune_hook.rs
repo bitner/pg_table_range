@@ -3,6 +3,7 @@ use pgrx::prelude::*;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
+use std::rc::Rc;
 
 use crate::index_storage::ColSummary;
 use crate::{TABLE_RANGE_ENABLE_PRUNING, TABLE_RANGE_LOG_PRUNING_DEBUG};
@@ -34,7 +35,7 @@ static mut PREV_PLANNER_HOOK: pg_sys::planner_hook_type = None;
 /// Per-partition summaries read from each partition's index, cached for one planner
 /// invocation (keyed by partition relid). A relid present with an empty vec means
 /// "checked, no table_range index / no summary".
-type SummaryMap = HashMap<u32, Vec<ColSummary>>;
+type SummaryMap = HashMap<u32, Rc<Vec<ColSummary>>>;
 
 thread_local! {
     /// Summaries read during the current planner invocation. Cleared per top-level plan.
@@ -279,21 +280,33 @@ unsafe fn load_summary(rel: *mut pg_sys::RelOptInfo, relid_u32: u32) {
     });
 }
 
+/// Empty shared summary returned when a relation has no usable table_range summary.
+fn empty_summary() -> Rc<Vec<ColSummary>> {
+    thread_local!(static EMPTY: Rc<Vec<ColSummary>> = Rc::new(Vec::new()));
+    EMPTY.with(Rc::clone)
+}
+
 // We rely on the planner having put the table_range index into `rel->indexlist`. The
 // planner only lists indexes with `indisvalid = true`, so a table_range index must be
 // valid for pruning to engage — if anything marks it invalid (e.g. an external
 // "hide indexes" DDL hook), `indexlist` omits it and we silently fall back to KEEP.
-unsafe fn read_index_summary(rel: *mut pg_sys::RelOptInfo) -> Vec<ColSummary> {
+unsafe fn read_index_summary(rel: *mut pg_sys::RelOptInfo) -> Rc<Vec<ColSummary>> {
     let am = table_range_am_oid();
     if am == pg_sys::Oid::INVALID || (*rel).indexlist.is_null() {
-        return Vec::new();
+        return empty_summary();
     }
     let indexes = pgrx::PgList::<pg_sys::IndexOptInfo>::from_pg((*rel).indexlist);
     for idx in indexes.iter_ptr() {
         if idx.is_null() || (*idx).relam != am {
             continue;
         }
-        let irel = pg_sys::index_open((*idx).indexoid, pg_sys::AccessShareLock as i32);
+        let indexoid = (*idx).indexoid;
+        // Warm path: a backend-lifetime cache lets repeated plans skip the index open and
+        // metapage read+deserialize entirely (kept coherent by a relcache callback).
+        if let Some(cached) = crate::summary_cache::get(indexoid) {
+            return cached;
+        }
+        let irel = pg_sys::index_open(indexoid, pg_sys::AccessShareLock as i32);
         // A partitioned (parent) index has no storage; only leaf indexes hold summaries.
         let has_storage =
             (*(*irel).rd_rel).relkind != pg_sys::RELKIND_PARTITIONED_INDEX as std::ffi::c_char;
@@ -303,9 +316,11 @@ unsafe fn read_index_summary(rel: *mut pg_sys::RelOptInfo) -> Vec<ColSummary> {
             None
         };
         pg_sys::index_close(irel, pg_sys::AccessShareLock as i32);
-        return summary.map(|s| s.cols).unwrap_or_default();
+        let cols = Rc::new(summary.map(|s| s.cols).unwrap_or_default());
+        crate::summary_cache::put(indexoid, Rc::clone(&cols));
+        return cols;
     }
-    Vec::new()
+    empty_summary()
 }
 
 /// Returns true iff some restriction clause proves the partition cannot match.
@@ -321,8 +336,8 @@ unsafe fn evaluate_relation(rel: *mut pg_sys::RelOptInfo, relid: pg_sys::Oid) ->
 
     CACHE.with(|c| {
         let borrow = c.borrow();
-        let rows = match borrow.get(&relid_u32) {
-            Some(rows) if !rows.is_empty() => rows,
+        let rows: &[ColSummary] = match borrow.get(&relid_u32) {
+            Some(rows) if !rows.is_empty() => rows.as_slice(),
             _ => return false, // no summary -> never prune
         };
 

@@ -9,6 +9,7 @@ mod index_am;
 mod index_storage;
 mod prune_hook;
 mod summary_build;
+mod summary_cache;
 
 /// Master switch for planner-side partition pruning.
 pub(crate) static TABLE_RANGE_ENABLE_PRUNING: GucSetting<bool> = GucSetting::<bool>::new(true);
@@ -38,6 +39,8 @@ pub extern "C-unwind" fn _PG_init() {
 
     // Install the real planner-time partition pruning hooks.
     prune_hook::install();
+    // Register the relcache callback that keeps the per-index summary cache coherent.
+    summary_cache::register();
 }
 
 #[cfg(any(test, feature = "pg_test"))]

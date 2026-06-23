@@ -145,6 +145,9 @@ unsafe fn widen_on_insert(
     }
     if changed {
         let _ = index_storage::write_summary(index, &summary);
+        // The on-page summary just widened; drop any cached (now-too-narrow) copy in every
+        // backend so planning never prunes away the newly covered values.
+        crate::summary_cache::note_widened((*index).rd_id);
     }
 }
 
