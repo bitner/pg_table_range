@@ -31,32 +31,52 @@ without it.
 
 ## Installation
 
-This is a [pgrx](https://github.com/pgcentralfoundation/pgrx) (Rust) extension, so it is
-built and installed with `cargo pgrx` rather than a PGXS `make`. You need a Rust toolchain
-and `cargo-pgrx` matching the pgrx version this release pins (currently **0.18.1**):
+This is a [pgrx](https://github.com/pgcentralfoundation/pgrx) (Rust) extension. Supported:
+PostgreSQL **16, 17, 18**. Pick whichever route fits; after installing, run
+`CREATE EXTENSION pg_table_range;` in each database that should use it.
+
+### Docker (PostgreSQL 18 + PostGIS, batteries included)
+
+```sh
+docker run -e POSTGRES_PASSWORD=secret ghcr.io/bitner/pg_table_range:18
+```
+
+The image extends the official `postgres:18` with PostGIS and pg_table_range, and enables
+both extensions in the default database on first start. Tags: `:18`, `:vX.Y.Z`, `:latest`.
+
+### Debian / Ubuntu package (no Rust toolchain needed)
+
+Prebuilt `.deb`s for PostgreSQL 16/17/18 (Debian **bookworm**, for the
+[apt.postgresql.org / PGDG](https://wiki.postgresql.org/wiki/Apt) packages) are attached to
+each [GitHub release](https://github.com/bitner/pg_table_range/releases):
+
+```sh
+sudo apt install ./postgresql-18-pg-table-range_<version>-1_amd64.deb
+```
+
+### From source with cargo-pgrx
+
+Requires a Rust toolchain and `cargo-pgrx` matching the pinned pgrx version (**0.18.1**).
+The bundled `Makefile` wraps cargo-pgrx (it writes a minimal pgrx `config.toml` for you, so
+no `cargo pgrx init`/`initdb` is needed):
 
 ```sh
 cargo install cargo-pgrx --version 0.18.1 --locked
-
-# In a checkout of the source (from git or a PGXN download), install into the PostgreSQL
-# that `pg_config` points at. Match the feature flag to your server's major version:
-cargo pgrx install --release                                   # PostgreSQL 18 (default)
-cargo pgrx install --release --no-default-features --features pg17   # PostgreSQL 17
-cargo pgrx install --release --no-default-features --features pg16   # PostgreSQL 16
+make install PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config   # major auto-detected from pg_config
 ```
 
-Use `--pg-config /path/to/pg_config` to target a specific PostgreSQL install. Then, in
-each database that should use it:
+Or drive cargo-pgrx directly — register your PostgreSQL once, then install (use
+`--no-default-features --features pg16|pg17` for those majors):
 
-```sql
-CREATE EXTENSION pg_table_range;
+```sh
+cargo pgrx init --pg18 /usr/lib/postgresql/18/bin/pg_config
+cargo pgrx install --release
 ```
 
-Supported: PostgreSQL 16, 17, and 18.
-
-The distribution is also published on [PGXN](https://pgxn.org/dist/pg_table_range/). Note
-that `pgxn install` (which expects a PGXS Makefile) does **not** apply here; use
-`pgxn download pg_table_range`, unzip, and run `cargo pgrx install` as above.
+The distribution is also on [PGXN](https://pgxn.org/dist/pg_table_range/): `pgxn download
+pg_table_range`, unzip, then `make install` (or the cargo-pgrx commands above). `pgxn
+install` runs the bundled `Makefile`, so it works too — but still needs cargo-pgrx present,
+since this is a Rust extension rather than a C/PGXS one.
 
 ## Quick Start
 
@@ -316,12 +336,21 @@ range-type tests, which exercise the same code path.
 
 ## Releasing (maintainers)
 
-The distribution is published to [PGXN](https://pgxn.org). Releases are automated by
-`.github/workflows/release.yml`, which runs on any `v*` tag and uses the
-[`pgxn/pgxn-tools`](https://github.com/pgxn/pgxn-tools) image to validate `META.json`,
-bundle the source, and upload it. One-time setup: add two repository secrets,
-`PGXN_USERNAME` and `PGXN_PASSWORD`, from a [PGXN Manager](https://manager.pgxn.org)
-account.
+`.github/workflows/release.yml` runs on any `v*` tag and produces everything:
+
+| Job | Output |
+|-----|--------|
+| `debian` | `.deb` packages for PostgreSQL 16/17/18 (Debian bookworm / PGDG), built in a `debian:bookworm` container with `packaging/build-deb.sh` |
+| `docker` | `ghcr.io/<owner>/pg_table_range:18`, `:vX.Y.Z`, `:latest` (PostgreSQL 18 + PostGIS + the extension) |
+| `github-release` | attaches the `.deb`s to the GitHub Release |
+| `pgxn` | validates `META.json`, bundles the source, and uploads it to [PGXN](https://pgxn.org) |
+
+`workflow_dispatch` runs `debian` + `docker` as a **dry run** (no pushes), to validate
+packaging without cutting a release.
+
+One-time setup: add two repository secrets, `PGXN_USERNAME` and `PGXN_PASSWORD`, from a
+[PGXN Manager](https://manager.pgxn.org) account. (The Docker push uses the built-in
+`GITHUB_TOKEN`; ensure the repo allows GitHub Actions to publish packages.)
 
 To cut a release:
 
