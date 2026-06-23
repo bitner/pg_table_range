@@ -45,6 +45,40 @@ thread_local! {
     static PLAN_DEPTH: Cell<u32> = const { Cell::new(0) };
     /// Guards against re-entering pruning logic from the SPI overlap evaluation issues.
     static IN_HOOK: Cell<bool> = const { Cell::new(false) };
+    /// Per-plan memo of each column type's btree compare proc OID (the lookup is three
+    /// syscache hits, identical for every partition of a column, so we do it once).
+    static CMP_PROC_MEMO: RefCell<HashMap<u32, Option<pg_sys::Oid>>> = RefCell::new(HashMap::new());
+    /// Per-plan memo of parsed query constants, keyed by (type oid, text). The same
+    /// constant is otherwise re-rendered and re-parsed once per partition.
+    static CONST_MEMO: RefCell<HashMap<(u32, String), pg_sys::Datum>> = RefCell::new(HashMap::new());
+}
+
+/// Compare proc for `typ`, memoized for the current plan. See [`btree_cmp_proc`].
+unsafe fn cmp_proc_cached(typ: pg_sys::Oid) -> Option<pg_sys::Oid> {
+    let key: u32 = typ.into();
+    if let Some(v) = CMP_PROC_MEMO.with(|m| m.borrow().get(&key).copied()) {
+        return v;
+    }
+    let v = btree_cmp_proc(typ);
+    CMP_PROC_MEMO.with(|m| {
+        m.borrow_mut().insert(key, v);
+    });
+    v
+}
+
+/// Parse `text` to a Datum of `typ`, memoized for the current plan. The cached Datum is
+/// allocated in the planner's memory context (which outlives the plan) and the memo is
+/// cleared per top-level plan, so the pointer stays valid for its lifetime.
+unsafe fn const_datum_cached(typ: pg_sys::Oid, text: &str) -> Option<pg_sys::Datum> {
+    let key = (typ.into(), text.to_string());
+    if let Some(d) = CONST_MEMO.with(|m| m.borrow().get(&key).copied()) {
+        return Some(d);
+    }
+    let d = text_to_datum(typ, text)?;
+    CONST_MEMO.with(|m| {
+        m.borrow_mut().insert(key, d);
+    });
+    Some(d)
 }
 
 /// Install our planner and pathlist hooks, preserving any previously-registered hooks.
@@ -137,6 +171,8 @@ unsafe extern "C-unwind" fn table_range_pathlist_hook(
 fn clear_cache() {
     CACHE.with(|c| c.borrow_mut().clear());
     AM_OID.with(|c| c.set(None));
+    CMP_PROC_MEMO.with(|c| c.borrow_mut().clear());
+    CONST_MEMO.with(|c| c.borrow_mut().clear());
 }
 
 /// The table_range access-method OID, resolved once per planner invocation.
@@ -466,11 +502,11 @@ unsafe fn eval_compare(
         (Some(min), Some(max)) => (min, max),
         _ => return false, // no usable range -> conservative KEEP
     };
-    let cmpproc = match btree_cmp_proc(typ) {
+    let cmpproc = match cmp_proc_cached(typ) {
         Some(p) => p,
         None => return false,
     };
-    let k = match text_to_datum(typ, const_text) {
+    let k = match const_datum_cached(typ, const_text) {
         Some(d) => d,
         None => return false,
     };
@@ -503,7 +539,7 @@ unsafe fn eval_in_list(
         (Some(min), Some(max)) => (min, max),
         _ => return false,
     };
-    let cmpproc = match btree_cmp_proc(typ) {
+    let cmpproc = match cmp_proc_cached(typ) {
         Some(p) => p,
         None => return false,
     };
@@ -522,7 +558,7 @@ unsafe fn eval_in_list(
             Some(t) => t,
             None => continue, // NULL element never matches a value
         };
-        let d = match text_to_datum(typ, text) {
+        let d = match const_datum_cached(typ, text) {
             Some(d) => d,
             None => return false,
         };
