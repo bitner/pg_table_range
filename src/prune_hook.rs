@@ -162,6 +162,10 @@ unsafe fn load_summary(rel: *mut pg_sys::RelOptInfo, relid_u32: u32) {
     });
 }
 
+// We rely on the planner having put the table_range index into `rel->indexlist`. The
+// planner only lists indexes with `indisvalid = true`, so a table_range index must be
+// valid for pruning to engage — if anything marks it invalid (e.g. an external
+// "hide indexes" DDL hook), `indexlist` omits it and we silently fall back to KEEP.
 unsafe fn read_index_summary(rel: *mut pg_sys::RelOptInfo) -> Vec<ColSummary> {
     let am = table_range_am_oid();
     if am == pg_sys::Oid::INVALID || (*rel).indexlist.is_null() {
