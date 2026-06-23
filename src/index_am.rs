@@ -135,7 +135,7 @@ unsafe fn widen_on_insert(
             Some(c) => c,
             None => continue,
         };
-        let typoid = (*pg_sys::TupleDescAttr((*index).rd_att, i as i32)).atttypid;
+        let typoid = att_typid((*index).rd_att, i);
         let collation = if (*index).rd_indcollation.is_null() {
             pg_sys::Oid::INVALID
         } else {
@@ -146,6 +146,20 @@ unsafe fn widen_on_insert(
     if changed {
         let _ = index_storage::write_summary(index, &summary);
     }
+}
+
+/// The type OID of a tuple descriptor's `i`-th attribute, portable across PG versions.
+/// PG18 made `TupleDescAttr` an inline function (bound by pgrx) and moved attributes to
+/// `compact_attrs` (which has no `atttypid`); PG13–17 expose `attrs` directly and only a
+/// `TupleDescAttr` macro (which bindgen does not surface as `pg_sys::TupleDescAttr`).
+#[cfg(feature = "pg18")]
+unsafe fn att_typid(tupdesc: pg_sys::TupleDesc, i: usize) -> pg_sys::Oid {
+    (*pg_sys::TupleDescAttr(tupdesc, i as i32)).atttypid
+}
+#[cfg(not(feature = "pg18"))]
+unsafe fn att_typid(tupdesc: pg_sys::TupleDesc, i: usize) -> pg_sys::Oid {
+    let natts = (*tupdesc).natts as usize;
+    (*tupdesc).attrs.as_slice(natts)[i].atttypid
 }
 
 /// Widen one column's summary for a single inserted value. Returns whether it changed.
