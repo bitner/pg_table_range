@@ -1,5 +1,5 @@
 use crate::index_storage::{self, ColSummary};
-use crate::insert_cache::InsertCache;
+use crate::insert_cache::{self, InsertCache};
 use crate::prune_hook::{btree_cmp_proc, datum_cmp, datum_to_text, text_to_datum};
 use crate::stable_io::with_stable_io;
 use crate::summary_build::{geometry_schema, spi_value};
@@ -71,6 +71,20 @@ unsafe extern "C-unwind" fn am_build(
             "table_range indexes cannot be partial"
         );
     }
+    // Summaries are keyed by column, so a column indexed twice (e.g. under two
+    // collations) would mix both orderings in one summary.
+    let attnums = &(&(*index_info).ii_IndexAttrNumbers)[..(*index_info).ii_NumIndexAttrs as usize];
+    if attnums
+        .iter()
+        .enumerate()
+        .any(|(i, a)| *a > 0 && attnums[..i].contains(a))
+    {
+        ereport!(
+            ERROR,
+            PgSqlErrorCode::ERRCODE_FEATURE_NOT_SUPPORTED,
+            "a column can appear only once in a table_range index"
+        );
+    }
 
     let mut built = crate::summary_build::build_leaf_summary(heap, index, index_info, false);
     index_storage::write_summary(index, &mut built.summary).unwrap_or_else(|e| error!("{e}"));
@@ -116,44 +130,44 @@ unsafe fn widen_on_insert(
     values: *mut pg_sys::Datum,
     isnull: *mut bool,
 ) {
-    let cache = crate::insert_cache::slot(index_info);
+    unsafe fn stable<T>(f: impl FnOnce() -> T) -> T {
+        with_stable_io(f)
+            .unwrap_or_else(|| error!("table_range: cannot maintain a summary in parallel mode"))
+    }
+    let slot = insert_cache::slot(index_info);
     loop {
         pgrx::check_for_interrupts!();
         // No summary, or an unreadable one: the planner never prunes with it.
-        let Some(before) = index_storage::read_blob(index) else {
+        let Some(page) = index_storage::read_blob(index) else {
             return;
         };
-        if !cache.as_ref().is_some_and(|c| c.matches(&before)) {
-            let Some(summary) = index_storage::deserialize(&before) else {
+        if slot.as_ref().is_none_or(|c| c.blob != page) {
+            insert_cache::forget(slot);
+            let Some(summary) = index_storage::deserialize(&page) else {
                 return;
             };
-            *cache = Some(
-                with_stable_io(|| InsertCache::decode(before.clone(), &summary, index, index_info))
-                    .unwrap_or_else(|| {
-                        error!("table_range: cannot maintain a summary in parallel mode")
-                    }),
-            );
+            *slot = Some(stable(|| {
+                InsertCache::decode(page, summary, index, index_info)
+            }));
         }
-        let decoded = cache.as_mut().expect("decoded above");
-        if decoded.covers(values, isnull) {
+        let cache = slot.as_mut().expect("decoded above");
+        if cache.covers(values, isnull) {
             return;
         }
-        let Some(mut summary) = index_storage::deserialize(&before) else {
-            return;
-        };
-        let changed = with_stable_io(|| decoded.widen(&mut summary, values, isnull))
-            .unwrap_or_else(|| error!("table_range: cannot maintain a summary in parallel mode"));
-        if !changed {
+        let mut summary = cache.summary.clone();
+        if !stable(|| cache.widen(&mut summary, values, isnull)) {
             return;
         }
         let after = index_storage::encode_fitting(&mut summary);
-        if index_storage::replace_blob_if(index, &before, &after).unwrap_or_else(|e| error!("{e}"))
+        if index_storage::replace_blob_if(index, &cache.blob, &after)
+            .unwrap_or_else(|e| error!("{e}"))
         {
-            crate::summary_cache::note_widened((*index).rd_id, (*heap).rd_id);
-            decoded.absorb(after, &summary, values, isnull);
+            crate::summary_cache::note_changed((*index).rd_id, (*heap).rd_id);
+            cache.wrote(after, summary);
             return;
         }
-        // Changed by another backend since we read it: retry.
+        // Changed by another backend since we read it: decode the new page and retry.
+        insert_cache::forget(slot);
     }
 }
 
@@ -279,8 +293,7 @@ unsafe fn widen_overlap(
     value: pg_sys::Datum,
 ) -> Option<bool> {
     let base = pg_sys::getBaseType(typoid);
-    let is_geometry = col.type_name.ends_with(".geometry");
-    let widened = if is_geometry {
+    let widened = if crate::summary_build::is_geometry(base) {
         geometry_extent_with(col, typoid, value)?
     } else {
         let merged = match &col.min {
@@ -340,8 +353,9 @@ unsafe extern "C-unwind" fn am_bulkdelete(
     stats
 }
 
+/// Rebuilds summaries that are unbounded (e.g. once an oversized value is deleted) or were
+/// left mid-rebuild.
 #[pg_guard]
-/// Re-summarizes an unbounded summary (e.g. once an oversized value is deleted).
 unsafe extern "C-unwind" fn am_vacuumcleanup(
     info: *mut pg_sys::IndexVacuumInfo,
     stats: *mut pg_sys::IndexBulkDeleteResult,

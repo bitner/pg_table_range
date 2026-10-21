@@ -95,9 +95,10 @@ CREATE INDEX events_tr ON events USING table_range (val, created_at);
 -- Verify with EXPLAIN: non-matching partitions disappear from the plan.
 EXPLAIN (COSTS OFF) SELECT * FROM events WHERE val >= 250;
 
--- Inserts maintain the summary automatically; REINDEX re-tightens it after deletes.
+-- Inserts maintain the summary automatically. After deletes (and VACUUM),
+-- table_range_summarize re-tightens it without blocking writes.
+SELECT table_range_summarize('events_tr'::regclass);
 -- DROP INDEX removes the summary with the index.
-REINDEX INDEX events_tr;
 DROP INDEX events_tr;
 ```
 
@@ -157,13 +158,14 @@ EXPLAIN (COSTS OFF) SELECT * FROM places WHERE geom && ST_MakeEnvelope(0,0,10,10
   large for the metapage), that column becomes *unbounded* — it no longer prunes by
   value, but is never too narrow. Pruning therefore stays correct **and** active across
   inserts without any rebuild. Deletes only shrink a partition's true range, leaving the
-  summary conservatively wide (still safe); `REINDEX` re-tightens it once the deleted rows
-  are no longer visible to any transaction. `DROP INDEX` removes the summary with the
-  index's storage — there is no side table to clean up.
+  summary conservatively wide (still safe); see *Re-summarizing* for re-tightening it.
+  `DROP INDEX` removes the summary with the index's storage — there is no side table to
+  clean up.
 - **Re-summarizing.** `table_range_summarize` rebuilds summaries from the data without
-  blocking inserts (like BRIN summarization), re-tightening bounds after deletes. `VACUUM`
-  does the same for any summary with an unbounded column, e.g. once an oversized value has
-  been deleted.
+  blocking inserts (like BRIN summarization). It covers every row version still in the
+  table, so it re-tightens bounds once `VACUUM` has removed deleted rows. `VACUUM` itself
+  rebuilds any summary with an unbounded column (e.g. once an oversized value has been
+  deleted) or one left mid-rebuild. `REINDEX` also rebuilds summaries, but blocks writes.
 
 ## Performance
 
@@ -252,7 +254,8 @@ avoids everything `CHECK` constraints make you give up:
 | table_range, ascending values (every row widens the summary) | ~280 ms | 13.3 MB |
 
 Within a statement each partition's summary is decoded once, so a row inside the bounds
-costs a page read and a comparison (~0.4 µs) and writes nothing. A row that widens the
+costs a page read and a comparison (~0.4 µs) and writes nothing. For PostGIS geometry the
+comparison is a bounding-box containment check (~4 µs per covered row). A row that widens the
 summary costs ~2.3 µs and ~55 bytes of WAL. Every transaction that widens a summary also
 invalidates cached plans on that partition (see [Limitations](#limitations)).
 
@@ -337,7 +340,7 @@ Everything not listed is conservatively **kept** (never mispruned):
 `SELECT table_range_summarize('index'::regclass)` rebuilds every summary of a table_range
 index (each leaf of a partitioned index) from the data and returns how many it rebuilt.
 It takes `ShareUpdateExclusiveLock` on each partition in turn, so inserts continue; it
-requires owning the table.
+requires owning the table and, like `VACUUM`, runs index expressions as the table owner.
 
 ## Storage
 
@@ -345,9 +348,9 @@ There is no catalog table — each partition's summary lives on its `table_range
 metapage (block 0), written by `ambuild` and updated in place by `aminsert`, like BRIN.
 Bounds are stored as each type's text form, written and read with the type I/O settings
 that affect it (`DateStyle`, `IntervalStyle`, `extra_float_digits`) pinned to
-round-trip-exact values. The on-page format is versioned: version 3 is written, version 2 is
-still read, and a summary in an older format is never used for pruning until `REINDEX`
-rebuilds it.
+round-trip-exact values. The on-page format is versioned: format 2, or format 3 (format 2
+plus a header flag) while a rebuild is in progress. A summary in any other format is never
+used for pruning until `REINDEX` rebuilds it.
 
 ## Project layout
 
@@ -432,8 +435,13 @@ the published tarball via `.gitattributes`.
 - Partial indexes (`CREATE INDEX … USING table_range … WHERE …`) are rejected, and
   expression columns in a table_range index are not summarized.
 - Inserts keep summaries current incrementally, but deletes only relax them (the summary
-  can stay wider than the live data until a `REINDEX` re-tightens it) — always correct,
-  just potentially less selective.
+  can stay wider than the live data until `VACUUM` plus `table_range_summarize`, or a
+  `REINDEX`, re-tightens it) — always correct, just potentially less selective.
+- A `table_range_summarize` that errors or is cancelled leaves the summary marked
+  mid-rebuild, so that partition is not pruned until the next `VACUUM` or
+  `table_range_summarize`. `VACUUM (PARALLEL …)` skips rebuilding summaries; run
+  `table_range_summarize` instead.
+- A column can appear only once in a table_range index.
 - Every transaction that widens a summary invalidates cached plans on that partition in
   every backend (a widening's WAL is small, but plans are replanned). Append-only
   workloads whose values keep growing (e.g. timestamps) widen on most inserts.

@@ -124,11 +124,12 @@ expect_scans() {
 
 # 4. A bulk load keeps the partition pruning. A column made unbounded by an oversized
 #    value is restored by VACUUM once that row is deleted, and table_range_summarize
-#    re-tightens bounds after committed deletes.
+#    re-tightens bounds once deleted rows are vacuumed away. Autovacuum is off on these
+#    tables so its snapshots cannot keep deleted rows visible.
 q <<'SQL'
 CREATE TABLE vb (k int, n bigint, s text) PARTITION BY LIST (k);
-CREATE TABLE vb_1 PARTITION OF vb FOR VALUES IN (1);
-CREATE TABLE vb_2 PARTITION OF vb FOR VALUES IN (2);
+CREATE TABLE vb_1 PARTITION OF vb FOR VALUES IN (1) WITH (autovacuum_enabled = false);
+CREATE TABLE vb_2 PARTITION OF vb FOR VALUES IN (2) WITH (autovacuum_enabled = false);
 INSERT INTO vb VALUES (1, 0, 'm'), (2, 1000, 'm');
 CREATE INDEX vb_tr ON vb USING table_range (n, s);
 INSERT INTO vb SELECT 1, g, 'm' FROM generate_series(1, 200) g;
@@ -140,34 +141,108 @@ q -c "DELETE FROM vb WHERE length(s) > 100"
 q -c "VACUUM vb"
 expect_scans "VACUUM restores the bounds once it is deleted" "vb WHERE s = 'zz'" 0
 q -c "DELETE FROM vb WHERE k = 1 AND n > 100"
+q -c "VACUUM vb"
 q -c "SELECT table_range_summarize('vb_tr'::regclass)" >/dev/null
 expect_scans "table_range_summarize re-tightens after deletes" "vb WHERE n = 150" 0
 check "rows after re-summarizing" "vb WHERE n BETWEEN 0 AND 200"
 
 # 5. Rows inserted while a re-summarization scans the heap must be covered, including
-#    rows that land on pages the scan has already passed. The expression column is not
-#    summarized; it only makes every scan slow (~2 ms per row). Freed space on the first
-#    pages routes the concurrent inserts behind the scan.
+#    rows that land on pages the scan has already passed. The scan evaluates gate() for
+#    every row (an expression column, not summarized) and blocks at n = 600 while another
+#    backend holds an advisory lock. Space freed on the first page routes the inserts
+#    behind the scan.
 q <<'SQL'
-CREATE FUNCTION slow_id(bigint) RETURNS bigint LANGUAGE plpgsql IMMUTABLE
-    AS $$ BEGIN PERFORM pg_sleep(0.002); RETURN $1; END $$;
+CREATE FUNCTION gate(bigint) RETURNS bigint LANGUAGE plpgsql IMMUTABLE AS $$
+BEGIN
+    IF $1 = 600 THEN
+        PERFORM pg_advisory_lock_shared(4242);
+        PERFORM pg_advisory_unlock_shared(4242);
+    END IF;
+    RETURN $1;
+END $$;
 CREATE TABLE rs (k int, n bigint) PARTITION BY LIST (k);
-CREATE TABLE rs_1 PARTITION OF rs FOR VALUES IN (1);
+CREATE TABLE rs_1 PARTITION OF rs FOR VALUES IN (1) WITH (autovacuum_enabled = false);
 INSERT INTO rs SELECT 1, g FROM generate_series(1, 1000) g;
-CREATE INDEX rs_tr ON rs USING table_range (n, (slow_id(n)));
-DELETE FROM rs WHERE n <= 220;
+CREATE INDEX rs_tr ON rs USING table_range (n, (gate(n)));
+DELETE FROM rs WHERE n <= 150;
 VACUUM rs;
-INSERT INTO rs SELECT 1, g FROM generate_series(2000, 2100) g;
 SQL
+coproc GATE { "${PSQL[@]}" -d "$DB"; }
+printf '%s\n' "SELECT pg_advisory_lock(4242);" "SELECT 'held';" >&"${GATE[1]}"
+read -r -u "${GATE[0]}" _; read -r -u "${GATE[0]}" _
 q -c "SELECT table_range_summarize('rs_tr'::regclass)" >/dev/null &
 summarizer=$!
-sleep 0.8
-q -c "INSERT INTO rs VALUES (1, 50000)"
-q -c "INSERT INTO rs VALUES (1, -50000)"
+for _ in $(seq 100); do
+    waiting=$(q -c "SELECT count(*) FROM pg_stat_activity
+                    WHERE query LIKE 'SELECT table_range_summarize%' AND wait_event = 'advisory'")
+    [[ "$waiting" == 1 ]] && break
+    sleep 0.1
+done
+# One statement: the free space map rotates where each new search starts.
+q -c "INSERT INTO rs VALUES (1, 50000), (1, -50000)"
+behind=$(q -c "SELECT bool_and((ctid::text::point)[0] < (SELECT (ctid::text::point)[0] FROM rs WHERE n = 600))
+               FROM rs WHERE n IN (50000, -50000)")
+if [[ "$waiting" == 1 && "$behind" == t ]]; then
+    echo "ok   inserts landed behind the paused re-summarization scan"
+else
+    echo "FAIL precondition: scan paused=$waiting, inserts behind it=$behind"
+    failures=$((failures + 1))
+fi
+expect_scans "a summary being rebuilt never prunes" "rs WHERE n = 999999" 1
+printf '%s\n' "SELECT pg_advisory_unlock(4242);" >&"${GATE[1]}"
+exec {GATE[1]}>&-
 wait "$summarizer"
 check "insert above the range during re-summarization" "rs WHERE n = 50000"
 check "insert below the range during re-summarization" "rs WHERE n = -50000"
 expect_scans "re-summarized partition prunes" "rs WHERE n = 999999" 0
+
+# 6. Re-summarizing keeps row versions older snapshots can still see, including ones a
+#    HOT update replaced.
+q <<'SQL'
+CREATE TABLE ho (k int, x int, pad int) PARTITION BY LIST (k);
+CREATE TABLE ho_1 PARTITION OF ho FOR VALUES IN (1) WITH (autovacuum_enabled = false);
+INSERT INTO ho VALUES (1, 5, 0);
+CREATE INDEX ho_tr ON ho USING table_range (x);
+SQL
+coproc OLD { "${PSQL[@]}" -d "$DB"; }
+printf '%s\n' "BEGIN ISOLATION LEVEL REPEATABLE READ;" "SELECT count(*) FROM ho WHERE x = 5;" >&"${OLD[1]}"
+read -r -u "${OLD[0]}" _
+q -c "UPDATE ho SET x = 100"
+q -c "SELECT table_range_summarize('ho_tr'::regclass)" >/dev/null
+printf '%s\n' "SELECT count(*) FROM ho WHERE x = 5;" "COMMIT;" >&"${OLD[1]}"
+read -r -u "${OLD[0]}" seen
+exec {OLD[1]}>&-
+wait "$OLD_PID" || true
+if [[ "$seen" == 1 ]]; then
+    echo "ok   older snapshot still finds the row after a HOT update and re-summarize"
+else
+    echo "FAIL older snapshot after HOT update and re-summarize: rows=$seen, want 1"
+    failures=$((failures + 1))
+fi
+
+# 7. A widening whose transaction rolls back still reaches other backends: the page stays
+#    widened, so a later insert of the same value writes nothing and sends nothing.
+q <<'SQL'
+CREATE TABLE rb (k int, x int) PARTITION BY LIST (k);
+CREATE TABLE rb_1 PARTITION OF rb FOR VALUES IN (1);
+INSERT INTO rb SELECT 1, g FROM generate_series(0, 100) g;
+CREATE INDEX rb_tr ON rb USING table_range (x);
+SQL
+coproc WATCH { "${PSQL[@]}" -d "$DB"; }
+echo "SELECT count(*) FROM rb WHERE x = 500;" >&"${WATCH[1]}"
+read -r -u "${WATCH[0]}" _
+q -c "BEGIN" -c "INSERT INTO rb VALUES (1, 500)" -c "ROLLBACK"
+q -c "INSERT INTO rb VALUES (1, 500)"
+echo "SELECT count(*) FROM rb WHERE x = 500;" >&"${WATCH[1]}"
+read -r -u "${WATCH[0]}" seen
+exec {WATCH[1]}>&-
+wait "$WATCH_PID" || true
+if [[ "$seen" == 1 ]]; then
+    echo "ok   other backend sees a value first widened by a rolled-back insert"
+else
+    echo "FAIL rolled-back widening: other backend rows=$seen, want 1"
+    failures=$((failures + 1))
+fi
 
 if ((failures > 0)); then
     echo "$failures multi-session check(s) failed"

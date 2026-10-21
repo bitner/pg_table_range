@@ -4,44 +4,52 @@ use pgrx::PgMemoryContexts;
 use crate::index_am::{index_columns, widen_column};
 use crate::index_storage::IndexSummary;
 use crate::prune_hook::{btree_cmp_proc, datum_to_text, text_to_datum};
-use crate::summary_build::{copy_datum, free_datum};
+use crate::summary_build::{
+    call_cmp, copy_datum, fmgr_in_current, free_datum, is_geometry, type_name_parts,
+};
 
 // The summary decoded once per statement (kept in IndexInfo's ii_AmCache), so an insert
 // whose values are already covered only reads the page and compares binary values.
 
 pub(crate) struct InsertCache {
-    /// Page bytes the decoded bounds belong to.
-    blob: Vec<u8>,
+    /// The page bytes everything below was decoded from.
+    pub(crate) blob: Vec<u8>,
+    pub(crate) summary: IndexSummary,
     cols: Vec<CachedCol>,
-    /// ii_Context: holds the decoded datums and FmgrInfos for the statement.
+    /// Child of ii_Context holding the decoded datums; deleted when the cache is replaced.
     cxt: pg_sys::MemoryContext,
 }
 
 struct CachedCol {
     pos: usize,
-    attnum: i16,
+    /// Position of this column in `summary.cols`.
+    summary_pos: usize,
     typ: pg_sys::Oid,
     collation: pg_sys::Oid,
     typlen: i16,
     typbyval: bool,
-    has_nulls: bool,
-    all_nulls: bool,
     kind: Kind,
 }
 
 enum Kind {
     Unbounded,
-    /// `None` while the column has no values.
+    /// `bounds` is `None` while the column has no values.
     MinMax {
         cmp: *mut pg_sys::FmgrInfo,
         bounds: Option<(pg_sys::Datum, pg_sys::Datum)>,
     },
+    /// `extent` is `None` while the column has no values.
     Range {
         contains: *mut pg_sys::FmgrInfo,
         merge: *mut pg_sys::FmgrInfo,
         extent: Option<pg_sys::Datum>,
     },
-    /// Not decoded (geometry, or bounds that failed to parse): always widen_column.
+    /// Covered rows are checked with PostGIS's bounding-box `~`; widening uses `ST_Extent`.
+    Geometry {
+        contains: *mut pg_sys::FmgrInfo,
+        extent: Option<pg_sys::Datum>,
+    },
+    /// Bounds that do not parse back: always widen through `widen_column`.
     Opaque,
 }
 
@@ -55,274 +63,280 @@ pub(crate) unsafe fn slot(index_info: *mut pg_sys::IndexInfo) -> &'static mut Op
     &mut *((*index_info).ii_AmCache as *mut Option<InsertCache>)
 }
 
-impl InsertCache {
-    pub(crate) fn matches(&self, blob: &[u8]) -> bool {
-        self.blob == blob
+/// Empty the slot, freeing the decoded datums.
+pub(crate) unsafe fn forget(slot: &mut Option<InsertCache>) {
+    if let Some(old) = slot.take() {
+        pg_sys::MemoryContextDelete(old.cxt);
     }
+}
 
+impl InsertCache {
     /// Call with type I/O GUCs pinned.
     pub(crate) unsafe fn decode(
         blob: Vec<u8>,
-        summary: &IndexSummary,
+        summary: IndexSummary,
         index: pg_sys::Relation,
         index_info: *mut pg_sys::IndexInfo,
     ) -> InsertCache {
-        let cxt = (*index_info).ii_Context;
+        let cxt = pg_sys::AllocSetContextCreateExtended(
+            (*index_info).ii_Context,
+            c"table_range insert cache".as_ptr(),
+            pg_sys::ALLOCSET_DEFAULT_MINSIZE as usize,
+            pg_sys::ALLOCSET_DEFAULT_INITSIZE as usize,
+            pg_sys::ALLOCSET_DEFAULT_MAXSIZE as usize,
+        );
         let cols = PgMemoryContexts::For(cxt).switch_to(|_| {
             index_columns(index, index_info)
                 .into_iter()
                 .filter_map(|c| {
-                    let s = summary.cols.iter().find(|s| s.attnum == c.attnum)?;
+                    let summary_pos = summary.cols.iter().position(|s| s.attnum == c.attnum)?;
+                    let s = &summary.cols[summary_pos];
                     let base = pg_sys::getBaseType(c.typ);
                     let mut typlen: i16 = 0;
                     let mut typbyval = false;
                     pg_sys::get_typlenbyval(c.typ, &mut typlen, &mut typbyval);
-                    let parse =
-                        |t: &Option<String>| t.as_deref().and_then(|t| text_to_datum(base, t));
-                    let kind = if s.unbounded {
-                        Kind::Unbounded
-                    } else if !s.overlap {
-                        match (btree_cmp_proc(base), &s.min, &s.max) {
-                            (Some(proc), None, None) => Kind::MinMax {
-                                cmp: fmgr(proc, cxt),
-                                bounds: None,
-                            },
-                            (Some(proc), Some(_), Some(_)) => {
-                                match (parse(&s.min), parse(&s.max)) {
-                                    (Some(lo), Some(hi)) => Kind::MinMax {
-                                        cmp: fmgr(proc, cxt),
-                                        bounds: Some((lo, hi)),
-                                    },
-                                    _ => Kind::Opaque,
-                                }
+                    let parse = |t: &Option<String>| match t {
+                        None => Some(None),
+                        Some(t) => text_to_datum(base, t).map(Some),
+                    };
+                    let kind = match (parse(&s.min), parse(&s.max)) {
+                        _ if s.unbounded => Kind::Unbounded,
+                        (Some(lo), Some(hi)) if !s.overlap => {
+                            match (btree_cmp_proc(base), lo, hi) {
+                                (Some(p), Some(lo), Some(hi)) => Kind::MinMax {
+                                    cmp: fmgr_in_current(p),
+                                    bounds: Some((lo, hi)),
+                                },
+                                (Some(p), None, None) => Kind::MinMax {
+                                    cmp: fmgr_in_current(p),
+                                    bounds: None,
+                                },
+                                _ => Kind::Opaque,
                             }
-                            _ => Kind::Opaque,
                         }
-                    } else if pg_sys::get_typtype(base) as u8 == b'r' {
-                        let extent = parse(&s.min);
-                        if s.min.is_some() && extent.is_none() {
-                            Kind::Opaque
-                        } else {
+                        (Some(extent), _) if pg_sys::get_typtype(base) as u8 == b'r' => {
                             Kind::Range {
-                                contains: fmgr(pg_sys::Oid::from(pg_sys::F_RANGE_CONTAINS), cxt),
-                                merge: fmgr(
-                                    pg_sys::Oid::from(pg_sys::F_RANGE_MERGE_ANYRANGE_ANYRANGE),
-                                    cxt,
-                                ),
+                                contains: fmgr_in_current(pg_sys::Oid::from(
+                                    pg_sys::F_RANGE_CONTAINS,
+                                )),
+                                merge: fmgr_in_current(pg_sys::Oid::from(
+                                    pg_sys::F_RANGE_MERGE_ANYRANGE_ANYRANGE,
+                                )),
                                 extent,
                             }
                         }
-                    } else {
-                        Kind::Opaque
+                        (Some(extent), _) => match geometry_contains_proc(base) {
+                            Some(p) => Kind::Geometry {
+                                contains: fmgr_in_current(p),
+                                extent,
+                            },
+                            None => Kind::Opaque,
+                        },
+                        _ => Kind::Opaque,
                     };
                     Some(CachedCol {
                         pos: c.pos,
-                        attnum: c.attnum,
+                        summary_pos,
                         typ: c.typ,
                         collation: c.collation,
                         typlen,
                         typbyval,
-                        has_nulls: s.has_nulls,
-                        all_nulls: s.all_nulls,
                         kind,
                     })
                 })
                 .collect()
         });
-        InsertCache { blob, cols, cxt }
+        InsertCache {
+            blob,
+            summary,
+            cols,
+            cxt,
+        }
     }
 
     /// The row is already covered, so the summary needs no change.
     pub(crate) unsafe fn covers(&self, values: *mut pg_sys::Datum, isnull: *mut bool) -> bool {
         self.cols.iter().all(|c| {
+            let s = &self.summary.cols[c.summary_pos];
             if *isnull.add(c.pos) {
-                return c.has_nulls;
+                return s.has_nulls;
             }
             let v = *values.add(c.pos);
-            !c.all_nulls
+            // An all-null column must still record its first value.
+            !s.all_nulls
                 && match &c.kind {
                     Kind::Unbounded => true,
                     Kind::MinMax {
                         cmp,
                         bounds: Some((lo, hi)),
                     } => {
-                        call(*cmp, c.collation, v, *lo) >= 0 && call(*cmp, c.collation, v, *hi) <= 0
+                        call_cmp(*cmp, c.collation, v, *lo) >= 0
+                            && call_cmp(*cmp, c.collation, v, *hi) <= 0
                     }
                     Kind::Range {
                         contains,
                         extent: Some(e),
                         ..
-                    } => call(*contains, pg_sys::Oid::INVALID, *e, v) & 0xff != 0,
+                    }
+                    | Kind::Geometry {
+                        contains,
+                        extent: Some(e),
+                    } => test(*contains, *e, v),
                     _ => false,
                 }
         })
     }
 
-    /// Widen `summary` (decoded from this cache's blob) to cover the row, outputting only
-    /// the new bounds' text. Returns whether it changed. Call with type I/O GUCs pinned.
+    /// Widen `summary` (a copy of `self.summary`) to cover the row, updating the decoded
+    /// bounds to match. Returns whether it changed. If the caller cannot write the result,
+    /// it must `forget` this cache. Call with type I/O GUCs pinned.
     pub(crate) unsafe fn widen(
-        &self,
+        &mut self,
         summary: &mut IndexSummary,
         values: *mut pg_sys::Datum,
         isnull: *mut bool,
     ) -> bool {
-        let mut changed = false;
-        for c in &self.cols {
-            let Some(s) = summary.cols.iter_mut().find(|s| s.attnum == c.attnum) else {
-                continue;
-            };
-            let (v, null) = (*values.add(c.pos), *isnull.add(c.pos));
-            let text = |d| datum_to_text(c.typ, d);
-            match &c.kind {
-                _ if null || s.unbounded => {
-                    changed |= widen_column(s, c.typ, c.collation, v, null);
-                }
-                Kind::MinMax { cmp, bounds } => {
-                    if s.all_nulls {
-                        s.all_nulls = false;
-                        changed = true;
-                    }
-                    let (low, high) = match bounds {
-                        Some((lo, hi)) => (
-                            call(*cmp, c.collation, v, *lo) < 0,
-                            call(*cmp, c.collation, v, *hi) > 0,
-                        ),
-                        None => (true, true),
-                    };
-                    if low || high {
-                        match text(v) {
-                            Some(t) => {
-                                if low {
-                                    s.min = Some(t.clone());
-                                }
-                                if high {
-                                    s.max = Some(t);
-                                }
-                            }
-                            None => s.make_unbounded(),
-                        }
-                        changed = true;
-                    }
-                }
-                Kind::Range {
-                    contains,
-                    merge,
-                    extent,
-                } => {
-                    if s.all_nulls {
-                        s.all_nulls = false;
-                        changed = true;
-                    }
-                    let covered = extent
-                        .is_some_and(|e| call(*contains, pg_sys::Oid::INVALID, e, v) & 0xff != 0);
-                    if !covered {
-                        let merged = match extent {
-                            Some(e) => call_datum(*merge, *e, v),
-                            None => v,
-                        };
-                        match text(merged) {
-                            Some(t) => s.min = Some(t),
-                            None => s.make_unbounded(),
-                        }
-                        changed = true;
-                    }
-                }
-                Kind::Unbounded | Kind::Opaque => {
-                    changed |= widen_column(s, c.typ, c.collation, v, null);
-                }
-            }
-        }
-        changed
-    }
-
-    /// After writing `summary` (as `blob`) for this row, update the decoded bounds from the
-    /// row's own values instead of re-parsing.
-    pub(crate) unsafe fn absorb(
-        &mut self,
-        blob: Vec<u8>,
-        summary: &IndexSummary,
-        values: *mut pg_sys::Datum,
-        isnull: *mut bool,
-    ) {
         let cxt = self.cxt;
         PgMemoryContexts::For(cxt).switch_to(|_| {
+            let mut changed = false;
             for c in &mut self.cols {
-                let Some(s) = summary.cols.iter().find(|s| s.attnum == c.attnum) else {
-                    continue;
-                };
-                c.has_nulls = s.has_nulls;
-                c.all_nulls = s.all_nulls;
-                if s.unbounded {
-                    c.kind = Kind::Unbounded;
+                let s = &mut summary.cols[c.summary_pos];
+                let (v, null) = (*values.add(c.pos), *isnull.add(c.pos));
+                if null || s.unbounded || matches!(c.kind, Kind::Unbounded | Kind::Opaque) {
+                    changed |= widen_column(s, c.typ, c.collation, v, null);
                     continue;
                 }
-                if *isnull.add(c.pos) {
-                    continue;
+                if s.all_nulls {
+                    s.all_nulls = false;
+                    changed = true;
                 }
-                let v = *values.add(c.pos);
-                let (typlen, typbyval) = (c.typlen, c.typbyval);
-                match &mut c.kind {
-                    Kind::MinMax { cmp, bounds } => match bounds {
-                        None => {
-                            *bounds = Some((
-                                copy_datum(v, typlen, typbyval),
-                                copy_datum(v, typlen, typbyval),
-                            ))
-                        }
-                        Some((lo, hi)) => {
-                            if call(*cmp, c.collation, v, *lo) < 0 {
-                                free_datum(*lo, typbyval);
-                                *lo = copy_datum(v, typlen, typbyval);
+                let (typ, typlen, typbyval) = (c.typ, c.typlen, c.typbyval);
+                let copy = |d| copy_datum(d, typlen, typbyval);
+                changed |= match &mut c.kind {
+                    Kind::MinMax { cmp, bounds } => {
+                        let (low, high) = match bounds {
+                            Some((lo, hi)) => (
+                                call_cmp(*cmp, c.collation, v, *lo) < 0,
+                                call_cmp(*cmp, c.collation, v, *hi) > 0,
+                            ),
+                            None => (true, true),
+                        };
+                        match datum_to_text(typ, v) {
+                            _ if !(low || high) => false,
+                            None => {
+                                s.make_unbounded();
+                                true
                             }
-                            if call(*cmp, c.collation, v, *hi) > 0 {
-                                free_datum(*hi, typbyval);
-                                *hi = copy_datum(v, typlen, typbyval);
+                            Some(text) => {
+                                match bounds {
+                                    None => *bounds = Some((copy(v), copy(v))),
+                                    Some((lo, hi)) => {
+                                        for (side, moved) in [(lo, low), (hi, high)] {
+                                            if moved {
+                                                free_datum(*side, typbyval);
+                                                *side = copy(v);
+                                            }
+                                        }
+                                    }
+                                }
+                                if low {
+                                    s.min = Some(text.clone());
+                                }
+                                if high {
+                                    s.max = Some(text);
+                                }
+                                true
                             }
                         }
-                    },
+                    }
                     Kind::Range {
                         contains,
                         merge,
                         extent,
-                    } => {
-                        *extent = Some(match *extent {
-                            None => copy_datum(v, typlen, typbyval),
-                            Some(e) if call(*contains, pg_sys::Oid::INVALID, e, v) & 0xff != 0 => e,
-                            Some(e) => {
-                                let merged = call_datum(*merge, e, v);
-                                copy_datum(merged, typlen, typbyval)
+                    } => match *extent {
+                        Some(e) if test(*contains, e, v) => false,
+                        old => {
+                            let merged = match old {
+                                Some(e) => {
+                                    // range_merge may return one of its inputs as is.
+                                    let m = call(*merge, e, v);
+                                    if m == e || m == v {
+                                        copy(m)
+                                    } else {
+                                        m
+                                    }
+                                }
+                                None => copy(v),
+                            };
+                            match datum_to_text(typ, merged) {
+                                Some(text) => s.min = Some(text),
+                                None => s.make_unbounded(),
                             }
-                        });
-                    }
-                    Kind::Unbounded | Kind::Opaque => {}
+                            if let Some(e) = old {
+                                free_datum(e, typbyval);
+                            }
+                            *extent = Some(merged);
+                            true
+                        }
+                    },
+                    Kind::Geometry { contains, extent } => match *extent {
+                        Some(e) if test(*contains, e, v) => false,
+                        old => {
+                            let widened = widen_column(s, typ, c.collation, v, false);
+                            if widened {
+                                // ST_Extent produced the new extent; parse it (hex, GUC-free).
+                                if let Some(e) = old {
+                                    free_datum(e, typbyval);
+                                }
+                                *extent = s
+                                    .min
+                                    .as_deref()
+                                    .and_then(|t| text_to_datum(pg_sys::getBaseType(typ), t));
+                            }
+                            widened
+                        }
+                    },
+                    Kind::Unbounded | Kind::Opaque => unreachable!("handled above"),
+                };
+                if s.unbounded {
+                    c.kind = Kind::Unbounded;
                 }
             }
-        });
+            changed
+        })
+    }
+
+    /// `summary` (as `blob`) was written: it is now what the page holds.
+    pub(crate) fn wrote(&mut self, blob: Vec<u8>, summary: IndexSummary) {
+        for c in &mut self.cols {
+            // encode_fitting may have dropped bounds that did not fit on the page.
+            if summary.cols[c.summary_pos].unbounded {
+                c.kind = Kind::Unbounded;
+            }
+        }
         self.blob = blob;
+        self.summary = summary;
     }
 }
 
-unsafe fn fmgr(proc: pg_sys::Oid, cxt: pg_sys::MemoryContext) -> *mut pg_sys::FmgrInfo {
-    let finfo = pg_sys::MemoryContextAllocZero(cxt, std::mem::size_of::<pg_sys::FmgrInfo>())
-        as *mut pg_sys::FmgrInfo;
-    pg_sys::fmgr_info_cxt(proc, finfo, cxt);
-    finfo
+/// PostGIS's bounding-box `~` for its `geometry` type, looked up in that type's schema.
+unsafe fn geometry_contains_proc(base: pg_sys::Oid) -> Option<pg_sys::Oid> {
+    if !is_geometry(base) {
+        return None;
+    }
+    let nsp = std::ffi::CString::new(type_name_parts(base)?.0).ok()?;
+    let mut names = pgrx::PgList::<pg_sys::String>::new();
+    names.push(pg_sys::makeString(pg_sys::pstrdup(nsp.as_ptr())));
+    names.push(pg_sys::makeString(pg_sys::pstrdup(c"~".as_ptr())));
+    let op = pg_sys::OpernameGetOprid(names.into_pg(), base, base);
+    (op != pg_sys::Oid::INVALID).then(|| pg_sys::get_opcode(op))
 }
 
-unsafe fn call_datum(
-    f: *mut pg_sys::FmgrInfo,
-    a: pg_sys::Datum,
-    b: pg_sys::Datum,
-) -> pg_sys::Datum {
+unsafe fn call(f: *mut pg_sys::FmgrInfo, a: pg_sys::Datum, b: pg_sys::Datum) -> pg_sys::Datum {
     pg_sys::FunctionCall2Coll(f, pg_sys::Oid::INVALID, a, b)
 }
 
-/// For procs returning int32 (btree compare) or bool (`& 0xff`).
-unsafe fn call(
-    f: *mut pg_sys::FmgrInfo,
-    collation: pg_sys::Oid,
-    a: pg_sys::Datum,
-    b: pg_sys::Datum,
-) -> i32 {
-    pg_sys::FunctionCall2Coll(f, collation, a, b).value() as i32
+/// A boolean proc's result (bool is the low byte of the Datum).
+unsafe fn test(f: *mut pg_sys::FmgrInfo, a: pg_sys::Datum, b: pg_sys::Datum) -> bool {
+    call(f, a, b).value() & 0xff != 0
 }

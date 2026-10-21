@@ -1,4 +1,4 @@
-use crate::index_am::att_typid;
+use crate::index_am::index_columns;
 use crate::index_storage::{ColSummary, IndexSummary};
 use crate::prune_hook::{btree_cmp_proc, datum_to_text, text_to_datum};
 use pgrx::prelude::*;
@@ -54,13 +54,13 @@ struct BuildState {
     cxt: pg_sys::MemoryContext,
 }
 
-/// `include_in_progress`: the heap is not locked against writers, so rows of in-progress
-/// inserts must be covered too.
+/// `every_version`: writers may be running (re-summarizing), so fold in every row version
+/// still on the heap instead of the index build's view.
 pub(crate) unsafe fn build_leaf_summary(
     heap: pg_sys::Relation,
     index: pg_sys::Relation,
     index_info: *mut pg_sys::IndexInfo,
-    include_in_progress: bool,
+    every_version: bool,
 ) -> LeafBuild {
     let build_cxt = PgMemoryContexts::new("table_range build");
     let cxt = build_cxt.value();
@@ -69,22 +69,29 @@ pub(crate) unsafe fn build_leaf_summary(
         cxt,
     };
 
-    let scan = (*(*heap).rd_tableam)
-        .index_build_range_scan
-        .unwrap_or_else(|| error!("table_range: table access method cannot build indexes"));
-    let heap_tuples = scan(
-        heap,
-        index,
-        index_info,
-        true, // allow_sync
-        include_in_progress,
-        !include_in_progress, // progress: only a CREATE INDEX / REINDEX reports it
-        0,
-        pg_sys::InvalidBlockNumber,
-        Some(build_callback),
-        &mut state as *mut BuildState as *mut std::ffi::c_void,
-        std::ptr::null_mut(),
-    );
+    let heap_tuples = if every_version {
+        scan_every_version(heap, index_info, &mut state);
+        0.0
+    } else {
+        // CREATE INDEX / REINDEX: the build scan's HOT-chain shortcuts are made safe for
+        // older snapshots by indcheckxmin, which keeps the planner from using this index.
+        let scan = (*(*heap).rd_tableam)
+            .index_build_range_scan
+            .unwrap_or_else(|| error!("table_range: table access method cannot build indexes"));
+        scan(
+            heap,
+            index,
+            index_info,
+            true,  // allow_sync
+            false, // anyvisible
+            true,  // progress
+            0,
+            pg_sys::InvalidBlockNumber,
+            Some(build_callback),
+            &mut state as *mut BuildState as *mut std::ffi::c_void,
+            std::ptr::null_mut(),
+        )
+    };
 
     let summary = crate::stable_io::with_stable_io(|| finish(&mut state))
         .unwrap_or_else(|| error!("table_range: cannot build a summary in parallel mode"));
@@ -99,20 +106,13 @@ unsafe fn plan_columns(
     index: pg_sys::Relation,
     index_info: *mut pg_sys::IndexInfo,
 ) -> Vec<ColumnBuild> {
-    let nattrs = (*index_info).ii_NumIndexAttrs.max(0) as usize;
     let mut cols = Vec::new();
-    for index_pos in 0..nattrs {
-        let attnum = (*index_info).ii_IndexAttrNumbers[index_pos];
-        if attnum <= 0 {
-            continue; // expression column: not summarized, so never used for pruning
-        }
-        let typ = att_typid((*index).rd_att, index_pos);
-        let base = pg_sys::getBaseType(typ);
-        let collation = if (*index).rd_indcollation.is_null() {
-            pg_sys::Oid::INVALID
-        } else {
-            *(*index).rd_indcollation.add(index_pos)
-        };
+    // Expression columns (attnum 0) are not summarized, so never used for pruning.
+    for c in index_columns(index, index_info)
+        .into_iter()
+        .filter(|c| c.attnum > 0)
+    {
+        let (typ, base) = (c.typ, pg_sys::getBaseType(c.typ));
         let mut typlen: i16 = 0;
         let mut typbyval = false;
         let mut typalign: std::ffi::c_char = 0;
@@ -125,7 +125,7 @@ unsafe fn plan_columns(
                 merge: fmgr_in_current(pg_sys::Oid::from(pg_sys::F_RANGE_MERGE_ANYRANGE_ANYRANGE)),
                 extent: None,
             }
-        } else if type_name_parts(base).is_some_and(|(_, name)| name == "geometry") {
+        } else if is_geometry(base) {
             Accumulator::Geometry {
                 batch: Vec::new(),
                 extent: None,
@@ -141,11 +141,13 @@ unsafe fn plan_columns(
             }
         };
         cols.push(ColumnBuild {
-            index_pos,
-            attnum,
+            index_pos: c.pos,
+            attnum: c.attnum,
             typ,
-            type_name: qualified_type_name(typ),
-            collation,
+            // The base type's name, so SQL resolves functions in its schema (PostGIS's for
+            // geometry), never in a domain's.
+            type_name: qualified_type_name(base),
+            collation: c.collation,
             typlen,
             typbyval,
             nonnull: 0,
@@ -166,7 +168,50 @@ unsafe extern "C-unwind" fn build_callback(
     state: *mut std::ffi::c_void,
 ) {
     // Recently-dead tuples are folded in too: an older snapshot may still see them.
-    let state = &mut *(state as *mut BuildState);
+    add_row(&mut *(state as *mut BuildState), values, isnull);
+}
+
+/// Every row version still on the heap, dead or alive. Writers may be running, and the
+/// index build scan skips HOT-updated versions that older snapshots can still see.
+unsafe fn scan_every_version(
+    heap: pg_sys::Relation,
+    index_info: *mut pg_sys::IndexInfo,
+    state: &mut BuildState,
+) {
+    let estate = pg_sys::CreateExecutorState();
+    let econtext = pg_sys::MakePerTupleExprContext(estate);
+    let slot = pg_sys::table_slot_create(heap, std::ptr::null_mut());
+    (*econtext).ecxt_scantuple = slot;
+    let am = &*(*heap).rd_tableam;
+    let scan = am.scan_begin.expect("table AM scan_begin")(
+        heap,
+        &raw mut pg_sys::SnapshotAnyData,
+        0,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        pg_sys::ScanOptions::SO_TYPE_SEQSCAN | pg_sys::ScanOptions::SO_ALLOW_STRAT,
+    );
+    let mut values = [pg_sys::Datum::from(0); pg_sys::INDEX_MAX_KEYS as usize];
+    let mut isnull = [false; pg_sys::INDEX_MAX_KEYS as usize];
+    let next = am.scan_getnextslot.expect("table AM scan_getnextslot");
+    while next(scan, pg_sys::ScanDirection::ForwardScanDirection, slot) {
+        pgrx::check_for_interrupts!();
+        pg_sys::MemoryContextReset((*econtext).ecxt_per_tuple_memory);
+        pg_sys::FormIndexDatum(
+            index_info,
+            slot,
+            estate,
+            values.as_mut_ptr(),
+            isnull.as_mut_ptr(),
+        );
+        add_row(state, values.as_mut_ptr(), isnull.as_mut_ptr());
+    }
+    am.scan_end.expect("table AM scan_end")(scan);
+    pg_sys::ExecDropSingleTupleTableSlot(slot);
+    pg_sys::FreeExecutorState(estate);
+}
+
+unsafe fn add_row(state: &mut BuildState, values: *mut pg_sys::Datum, isnull: *mut bool) {
     let cxt = state.cxt;
     for col in state.cols.iter_mut() {
         if *isnull.add(col.index_pos) {
@@ -340,13 +385,13 @@ unsafe fn finish(state: &mut BuildState) -> IndexSummary {
     summary
 }
 
-unsafe fn fmgr_in_current(proc: pg_sys::Oid) -> *mut pg_sys::FmgrInfo {
+pub(crate) unsafe fn fmgr_in_current(proc: pg_sys::Oid) -> *mut pg_sys::FmgrInfo {
     let finfo = pg_sys::palloc0(std::mem::size_of::<pg_sys::FmgrInfo>()) as *mut pg_sys::FmgrInfo;
     pg_sys::fmgr_info(proc, finfo);
     finfo
 }
 
-unsafe fn call_cmp(
+pub(crate) unsafe fn call_cmp(
     cmp: *mut pg_sys::FmgrInfo,
     collation: pg_sys::Oid,
     a: pg_sys::Datum,
@@ -378,7 +423,7 @@ pub(crate) unsafe fn free_datum(value: pg_sys::Datum, typbyval: bool) {
     }
 }
 
-unsafe fn type_name_parts(typ: pg_sys::Oid) -> Option<(String, String)> {
+pub(crate) unsafe fn type_name_parts(typ: pg_sys::Oid) -> Option<(String, String)> {
     let tup = pg_sys::SearchSysCache1(
         pg_sys::SysCacheIdentifier::TYPEOID as i32,
         pg_sys::Datum::from(typ),
@@ -407,46 +452,46 @@ unsafe fn qualified_type_name(typ: pg_sys::Oid) -> String {
     CStr::from_ptr(q).to_string_lossy().into_owned()
 }
 
+pub(crate) unsafe fn is_geometry(base: pg_sys::Oid) -> bool {
+    type_name_parts(base).is_some_and(|(_, name)| name == "geometry")
+}
+
 /// PostGIS functions live in the same schema as its `geometry` type.
 pub(crate) fn geometry_schema(type_name: &str) -> &str {
     type_name.strip_suffix(".geometry").unwrap_or("public")
 }
 
-/// `None` for NULL, no row, or a value that is not valid UTF-8.
-unsafe fn first_value() -> Option<String> {
-    if pg_sys::SPI_processed == 0 || pg_sys::SPI_tuptable.is_null() {
-        return None;
-    }
+/// First column of the last SPI result's rows: `None` for NULL or a value that is not
+/// valid UTF-8 (unknown, never a lossy copy).
+unsafe fn first_column() -> Vec<Option<String>> {
     let table = pg_sys::SPI_tuptable;
-    let p = pg_sys::SPI_getvalue(*(*table).vals, (*table).tupdesc, 1);
-    if p.is_null() {
-        None
-    } else {
-        CStr::from_ptr(p).to_str().ok().map(str::to_owned)
+    if table.is_null() {
+        return Vec::new();
     }
-}
-
-/// Read-only, so SPI uses the active snapshot rather than the transaction snapshot.
-pub(crate) unsafe fn spi_value(sql: &str) -> Option<String> {
-    let cmd = CString::new(sql).expect("SQL contains no NUL bytes");
-    let rc = pg_sys::SPI_execute(cmd.as_ptr(), true, 1);
-    if rc != pg_sys::SPI_OK_SELECT as i32 {
-        error!("table_range: SPI_execute failed ({rc}): {sql}");
-    }
-    first_value()
-}
-
-/// First column of every row of a read-only statement on the current SPI connection.
-pub(crate) unsafe fn spi_column(sql: &str) -> Vec<Option<String>> {
-    let cmd = CString::new(sql).expect("SQL contains no NUL bytes");
-    if pg_sys::SPI_execute(cmd.as_ptr(), true, 0) != pg_sys::SPI_OK_SELECT as i32 {
-        error!("table_range: SPI_execute failed: {sql}");
-    }
-    let table = pg_sys::SPI_tuptable;
     (0..pg_sys::SPI_processed as usize)
         .map(|r| {
             let p = pg_sys::SPI_getvalue(*(*table).vals.add(r), (*table).tupdesc, 1);
-            (!p.is_null()).then(|| CStr::from_ptr(p).to_string_lossy().into_owned())
+            (!p.is_null())
+                .then(|| CStr::from_ptr(p).to_str().ok().map(str::to_owned))
+                .flatten()
         })
         .collect()
+}
+
+unsafe fn first_value() -> Option<String> {
+    first_column().into_iter().next().flatten()
+}
+
+/// Read-only, so SPI uses the active snapshot rather than the transaction snapshot.
+pub(crate) unsafe fn spi_column(sql: &str) -> Vec<Option<String>> {
+    let cmd = CString::new(sql).expect("SQL contains no NUL bytes");
+    let rc = pg_sys::SPI_execute(cmd.as_ptr(), true, 0);
+    if rc != pg_sys::SPI_OK_SELECT as i32 {
+        error!("table_range: SPI_execute failed ({rc}): {sql}");
+    }
+    first_column()
+}
+
+pub(crate) unsafe fn spi_value(sql: &str) -> Option<String> {
+    spi_column(sql).into_iter().next().flatten()
 }

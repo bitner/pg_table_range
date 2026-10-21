@@ -2,17 +2,29 @@
 
 ## 0.2.0
 
-Upgrade with `ALTER EXTENSION pg_table_range UPDATE;`. Summaries written by 0.1.2 are
-read as they are, so no `REINDEX` is needed.
+Summaries written by 0.1.2 are read as they are, so no `REINDEX` is needed. To upgrade,
+install 0.2.0, **restart PostgreSQL** (a backend still running 0.1.2 cannot read a summary
+that is being rebuilt, and would skip maintaining it), then run
+`ALTER EXTENSION pg_table_range UPDATE;`.
 
 - Widening a summary on insert writes a small WAL record (the changed bytes) instead of a
   full page image: ~55 bytes instead of ~8.4 KB per widening row.
 - Inserts decode each partition's summary once per statement: a row inside the bounds
-  costs ~0.4 µs instead of ~14 µs, and a widening row ~2.3 µs.
+  costs ~0.4 µs instead of ~14 µs (PostGIS geometry: ~4 µs instead of ~70 µs), and a
+  widening row ~2.3 µs.
 - New `table_range_summarize(index)` rebuilds summaries from the data without blocking
-  inserts, re-tightening bounds after deletes. `VACUUM` rebuilds summaries that have an
-  unbounded column (e.g. after an oversized value is deleted).
-- Summaries are written in on-page format version 3; version 2 is still read.
+  inserts, re-tightening bounds once `VACUUM` has removed deleted rows. It runs index
+  expressions as the table owner. `VACUUM` rebuilds summaries that have an unbounded
+  column (e.g. after an oversized value is deleted) or were left mid-rebuild.
+- Fixed: an insert that widened a summary and then rolled back left the summary widened
+  without telling other backends. A later insert of a value in that range then changed
+  nothing, so other backends could keep pruning with their cached summary and miss the
+  committed row. This also affected 0.1.2. Widening now notifies other backends
+  immediately.
+- A column can no longer appear twice in a table_range index (e.g. under two
+  collations); both would have shared one summary.
+- Summaries are written in on-page format 2 as before, and in format 3 (with a header
+  flag) while a rebuild is in progress.
 
 ## 0.1.2
 

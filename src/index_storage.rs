@@ -145,9 +145,10 @@ pub struct IndexSummary {
 }
 
 // Formats older than version 2 are unreadable on purpose: they may not cover their data.
-const SUMMARY_VERSION: u8 = 3;
-/// Version 2 is version 3 without the header flags byte.
-const OLDEST_READABLE_VERSION: u8 = 2;
+const FORMAT_PLAIN: u8 = 2;
+/// FORMAT_PLAIN plus a header flags byte. Written only while summarizing, so pages stay
+/// readable by binaries that know only FORMAT_PLAIN.
+const FORMAT_WITH_HEADER: u8 = 3;
 
 const HEADER_SUMMARIZING: u8 = 1;
 
@@ -210,12 +211,11 @@ impl Reader<'_> {
 
 pub fn serialize(summary: &IndexSummary) -> Vec<u8> {
     let mut out = Vec::new();
-    out.push(SUMMARY_VERSION);
-    out.push(if summary.summarizing {
-        HEADER_SUMMARIZING
+    if summary.summarizing {
+        out.extend_from_slice(&[FORMAT_WITH_HEADER, HEADER_SUMMARIZING]);
     } else {
-        0
-    });
+        out.push(FORMAT_PLAIN);
+    }
     out.extend_from_slice(&(summary.cols.len() as u16).to_le_bytes());
     for c in &summary.cols {
         out.extend_from_slice(&c.attnum.to_le_bytes());
@@ -242,8 +242,8 @@ pub fn serialize(summary: &IndexSummary) -> Vec<u8> {
 pub fn deserialize(buf: &[u8]) -> Option<IndexSummary> {
     let mut r = Reader { buf, pos: 0 };
     let header = match r.u8()? {
-        SUMMARY_VERSION => r.u8()?,
-        OLDEST_READABLE_VERSION => 0,
+        FORMAT_WITH_HEADER => r.u8()?,
+        FORMAT_PLAIN => 0,
         _ => return None,
     };
     let ncols = r.u16()? as usize;
@@ -368,28 +368,53 @@ mod serde_tests {
     }
 
     #[test]
-    fn reads_version_2() {
+    fn reads_and_writes_plain_format() {
+        // A format-2 page: a bigint column with bounds [0, 99].
+        let plain = [
+            2, 1, 0, // format, ncols
+            2, 0, 0, 0, // attnum 2, minmax, no flags
+            0, 0, 0, 0, // collation
+            15, 0, b'p', b'g', b'_', b'c', b'a', b't', b'a', b'l', b'o', b'g', b'.', b'i', b'n',
+            b't', b'8', // type name
+            1, 1, 0, b'0', // min
+            1, 2, 0, b'9', b'9', // max
+        ];
         let s = IndexSummary {
-            cols: vec![col(1, "a", "b")],
+            cols: vec![ColSummary {
+                attnum: 2,
+                overlap: false,
+                type_name: "pg_catalog.int8".into(),
+                collation: pg_sys::Oid::INVALID,
+                min: Some("0".into()),
+                max: Some("99".into()),
+                has_nulls: false,
+                all_nulls: false,
+                unbounded: false,
+            }],
             summarizing: false,
         };
-        let mut v2 = serialize(&s);
-        v2.remove(1); // version 2 has no header flags byte
-        v2[0] = 2;
-        assert_eq!(deserialize(&v2), Some(s));
+        assert_eq!(deserialize(&plain), Some(s.clone()));
+        assert_eq!(
+            serialize(&s),
+            plain,
+            "a summary that is not summarizing stays plain"
+        );
     }
 
     #[test]
     fn rejects_garbage_and_wrong_version() {
         assert_eq!(deserialize(&[]), None);
         assert_eq!(deserialize(&[99, 0, 0]), None);
-        // Another format version is never trusted, even if well-formed.
-        let mut v1 = serialize(&IndexSummary {
+        // Any other format version is never trusted, even if well-formed.
+        let s = IndexSummary {
             cols: vec![col(1, "a", "b")],
-            summarizing: false,
-        });
-        v1[0] = 1;
-        assert_eq!(deserialize(&v1), None);
+            summarizing: true,
+        };
+        for version in [1, 4] {
+            let mut bytes = serialize(&s);
+            bytes[0] = version;
+            assert_eq!(deserialize(&bytes), None, "format {version}");
+        }
     }
 
     #[test]
@@ -419,18 +444,26 @@ fn table_range_test_read_summary(index: pg_sys::Oid) -> String {
         pg_sys::index_close(rel, pg_sys::AccessShareLock as i32);
         match s {
             None => "none".to_string(),
-            Some(s) => s
-                .cols
-                .iter()
-                .map(|c| {
-                    format!(
-                        "attnum={} overlap={} min={:?} max={:?} has_nulls={} all_nulls={} \
+            Some(s) => {
+                format!("summarizing={} ", s.summarizing)
+                    + &s.cols
+                        .iter()
+                        .map(|c| {
+                            format!(
+                                "attnum={} overlap={} min={:?} max={:?} has_nulls={} all_nulls={} \
                          unbounded={}",
-                        c.attnum, c.overlap, c.min, c.max, c.has_nulls, c.all_nulls, c.unbounded
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("; "),
+                                c.attnum,
+                                c.overlap,
+                                c.min,
+                                c.max,
+                                c.has_nulls,
+                                c.all_nulls,
+                                c.unbounded
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; ")
+            }
         }
     }
 }
@@ -456,6 +489,28 @@ fn table_range_test_write_blob(index: pg_sys::Oid, payload: &[u8]) {
     unsafe {
         let rel = pg_sys::index_open(index, pg_sys::AccessExclusiveLock as i32);
         write_blob(rel, payload).unwrap_or_else(|e| error!("write_blob: {e}"));
+        crate::summary_cache::note_changed(index, pg_sys::IndexGetRelation(index, false));
+        pg_sys::index_close(rel, pg_sys::AccessExclusiveLock as i32);
+    }
+}
+
+/// Overwrite one column's stored bounds (e.g. wider than the data).
+#[cfg(any(test, feature = "pg_test"))]
+#[pg_extern]
+fn table_range_test_set_bounds(index: pg_sys::Oid, attnum: i16, min: String, max: String) {
+    unsafe {
+        let rel = pg_sys::index_open(index, pg_sys::AccessExclusiveLock as i32);
+        let mut summary = read_summary(rel).unwrap_or_else(|| error!("no readable summary"));
+        let col = summary
+            .cols
+            .iter_mut()
+            .find(|c| c.attnum == attnum)
+            .unwrap_or_else(|| error!("no summary for column {attnum}"));
+        col.min = Some(min);
+        col.max = Some(max);
+        col.unbounded = false;
+        write_summary(rel, &mut summary).unwrap_or_else(|e| error!("{e}"));
+        crate::summary_cache::note_changed(index, pg_sys::IndexGetRelation(index, false));
         pg_sys::index_close(rel, pg_sys::AccessExclusiveLock as i32);
     }
 }

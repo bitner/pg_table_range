@@ -326,6 +326,60 @@ fn e2e_postgis_extent_pruning() {
 }
 
 #[pg_test]
+fn e2e_postgis_inserts_keep_exact_extent() {
+    // One statement mixes covered points, widening points and polygons, SRID 4326 points,
+    // empty geometries and NULLs; the extent must stay exact enough to prune right past it.
+    if !postgis_available() {
+        return;
+    }
+    Spi::run("CREATE EXTENSION IF NOT EXISTS postgis").unwrap();
+    e2e_two_partitions("gi", "g geometry");
+    Spi::run(
+        "INSERT INTO gi VALUES (1, ST_MakePoint(0, 0)), (1, ST_MakePoint(10, 10)),
+                               (2, ST_MakePoint(500, 500));
+         CREATE INDEX gi_tr ON gi USING table_range (g);
+         INSERT INTO gi
+         SELECT 1, CASE
+             WHEN i % 11 = 0 THEN NULL
+             WHEN i % 13 = 0 THEN 'POINT EMPTY'::geometry
+             WHEN i % 17 = 0 THEN ST_SetSRID(ST_MakePoint(i % 10, i % 10), 4326)
+             WHEN i % 19 = 0 THEN ST_MakeEnvelope(-i, -i, -i + 1, -i + 1)
+             WHEN i % 23 = 0 THEN ST_MakePoint(10 + i, 5)
+             ELSE ST_MakePoint(i % 10, (i * 7) % 10) END
+         FROM generate_series(1, 3000) i;",
+    )
+    .unwrap();
+    for pred in [
+        "g && ST_MakeEnvelope(-2995, -2995, -2990, -2990)",
+        "g && ST_MakeEnvelope(2950, 4, 3020, 6)",
+        "g && ST_MakeEnvelope(3, 3, 4, 4)",
+        "g && ST_MakeEnvelope(3, 3, 4, 4, 4326)",
+        "g && ST_MakeEnvelope(9000, 9000, 9001, 9001)",
+    ] {
+        e2e_same_on_off("gi", pred);
+    }
+    // A domain over geometry resolves PostGIS functions in geometry's schema.
+    Spi::run("DROP DOMAIN IF EXISTS gi_point CASCADE; CREATE DOMAIN gi_point AS geometry;")
+        .unwrap();
+    e2e_two_partitions("gd", "g gi_point");
+    Spi::run(
+        "INSERT INTO gd VALUES (1, ST_MakePoint(0, 0)), (2, ST_MakePoint(500, 500));
+         CREATE INDEX gd_tr ON gd USING table_range (g);
+         INSERT INTO gd SELECT 1, ST_MakePoint(i, i) FROM generate_series(1, 50) i;",
+    )
+    .unwrap();
+    assert!(e2e_same_on_off("gd", "g && ST_MakeEnvelope(49, 49, 51, 51)") > 0);
+    let plan = e2e_explain_on("gd", "g && ST_MakeEnvelope(60, 60, 61, 61)");
+    assert!(!plan.contains("on gd_1"), "{plan}");
+
+    // The data's extent ends at x = 2977.
+    let plan = e2e_explain_on("gi", "g && ST_MakeEnvelope(2976.5, 0, 2977, 1)");
+    assert!(plan.contains("on gi_1"), "a box at the edge keeps gi_1:\n{plan}");
+    let plan = e2e_explain_on("gi", "g && ST_MakeEnvelope(2978, 0, 2979, 1)");
+    assert!(!plan.contains("on gi_1"), "a box past the edge prunes gi_1:\n{plan}");
+}
+
+#[pg_test]
 fn e2e_range_overlap_pruning() {
     // Partitions hold disjoint int8range bands; query with the && (overlap) operator on
     // a non-key range column. Only the overlapping partition survives.
@@ -679,6 +733,17 @@ fn e2e_other_collation_is_not_pruned() {
     // Under the summary's own collation, 'mango' > 'b'.
     let plan = e2e_explain_on("co", "s < 'b'");
     assert!(!plan.contains("co_2"), "the summary's collation must prune:\n{plan}");
+
+    // Inserts widen under the summary's collation too: linguistically 'B' sorts after 'b',
+    // bytewise before it.
+    e2e_two_partitions("cw", &format!("s text COLLATE \"{coll}\""));
+    Spi::run(
+        "INSERT INTO cw VALUES (1, 'A'), (1, 'b'), (2, 'x');
+         CREATE INDEX cw_tr ON cw USING table_range (s);
+         INSERT INTO cw VALUES (1, 'A'), (1, 'B');",
+    )
+    .unwrap();
+    assert_eq!(e2e_same_on_off("cw", "s = 'B'"), 1);
 }
 
 #[pg_test]

@@ -5,6 +5,9 @@ use crate::index_storage::{self, ColSummary, IndexSummary};
 
 // Inserts continue during a rebuild: the page is flagged `summarizing` (never pruned) with
 // empty bounds that concurrent inserts widen, then merged with the scan's result.
+//
+// shortcut: a rebuild that errors or is cancelled leaves the page summarizing (never
+// pruned) until the next VACUUM or table_range_summarize; clear it on abort if that bites.
 
 /// Returns whether the summary was rebuilt. `only_unbounded` skips summaries whose bounds
 /// are all known, so a routine VACUUM does not rescan the partition.
@@ -44,7 +47,7 @@ pub(crate) unsafe fn resummarize(
     pg_sys::PopActiveSnapshot();
     if done {
         // The summary narrowed: let caches and cached plans pick up the tighter bounds.
-        crate::summary_cache::note_widened((*index).rd_id, (*heap).rd_id);
+        crate::summary_cache::note_changed((*index).rd_id, (*heap).rd_id);
     }
     done
 }
@@ -102,20 +105,20 @@ unsafe fn fold_in(
         m.has_nulls |= p.has_nulls;
         if p.unbounded {
             m.make_unbounded();
+            m.all_nulls = false;
+            continue;
         }
         for bound in [&p.min, &p.max].into_iter().flatten() {
-            if m.unbounded {
-                break;
-            }
             match crate::prune_hook::text_to_datum(pg_sys::getBaseType(c.typ), bound) {
                 Some(d) => {
                     widen_column(m, c.typ, c.collation, d, false);
                 }
-                None => m.make_unbounded(),
+                // Still a non-null value: unknown bounds, not an all-null column.
+                None => {
+                    m.make_unbounded();
+                    m.all_nulls = false;
+                }
             }
-        }
-        if p.unbounded || p.min.is_some() {
-            m.all_nulls = false;
         }
     }
 }
@@ -126,27 +129,45 @@ unsafe fn fold_in(
 fn table_range_summarize(index: pg_sys::Oid) -> i32 {
     unsafe {
         let am = pg_sys::get_am_oid(c"table_range".as_ptr(), false);
+        let name = |oid| {
+            let p = pg_sys::get_rel_name(oid);
+            if p.is_null() {
+                format!("{}", u32::from(oid))
+            } else {
+                std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
+            }
+        };
         let mut rebuilt = 0;
         for leaf in leaf_indexes(index) {
+            if pg_sys::get_rel_relkind(leaf) as u8 != pg_sys::RELKIND_INDEX {
+                error!("table_range: \"{}\" is not an index", name(leaf));
+            }
             let heap_oid = pg_sys::IndexGetRelation(leaf, false);
             if !pg_sys::object_ownercheck(pg_sys::RelationRelationId, heap_oid, pg_sys::GetUserId())
             {
-                error!(
-                    "table_range: must be owner of the table of index {}",
-                    u32::from(leaf)
-                );
+                error!("table_range: must be owner of table \"{}\"", name(heap_oid));
             }
             let heap = pg_sys::table_open(heap_oid, pg_sys::ShareUpdateExclusiveLock as i32);
             let irel = pg_sys::index_open(leaf, pg_sys::RowExclusiveLock as i32);
             if (*(*irel).rd_rel).relam != am {
-                error!(
-                    "table_range: {} is not a table_range index",
-                    u32::from(leaf)
-                );
+                error!("table_range: \"{}\" is not a table_range index", name(leaf));
             }
+            // Run index expressions as the table owner, as VACUUM and REINDEX do.
+            let mut user = pg_sys::Oid::INVALID;
+            let mut sec = 0;
+            pg_sys::GetUserIdAndSecContext(&mut user, &mut sec);
+            pg_sys::SetUserIdAndSecContext(
+                (*(*heap).rd_rel).relowner,
+                sec | pg_sys::SECURITY_RESTRICTED_OPERATION as i32,
+            );
+            let guc_level = pg_sys::NewGUCNestLevel();
+            #[cfg(not(feature = "pg16"))]
+            pg_sys::RestrictSearchPath();
             if resummarize(irel, heap, false) {
                 rebuilt += 1;
             }
+            pg_sys::AtEOXact_GUC(false, guc_level);
+            pg_sys::SetUserIdAndSecContext(user, sec);
             // Release per leaf, so many partitions do not exhaust the lock table.
             pg_sys::index_close(irel, pg_sys::RowExclusiveLock as i32);
             pg_sys::table_close(heap, pg_sys::ShareUpdateExclusiveLock as i32);

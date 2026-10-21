@@ -127,51 +127,100 @@ fn am_bulk_insert_widens_summary() {
     assert!(!plan.contains("on amt_1"), "a widened leaf still prunes:\n{plan}");
 }
 
+/// The table_range index on `leaf`.
+fn am_leaf_index(leaf: &str) -> String {
+    format!("(SELECT indexrelid FROM pg_index WHERE indrelid = '{leaf}'::regclass)")
+}
+
 #[pg_test]
-fn am_summarize_rebuilds_every_leaf() {
+fn am_summarize_narrows_to_the_data() {
     am_setup();
-    Spi::run(
-        "CREATE INDEX amt_tr ON amt USING table_range (val);
-         INSERT INTO amt VALUES (1, 5000);
-         DELETE FROM amt WHERE val = 5000;",
-    )
+    Spi::run("CREATE INDEX amt_tr ON amt USING table_range (val)").unwrap();
+    // amt_1 holds val 0..99; claim [-1000, 1000] so narrowing is observable.
+    Spi::run(&format!(
+        "SELECT table_range_test_set_bounds({}, 2::int2, '-1000', '1000')",
+        am_leaf_index("amt_1")
+    ))
     .unwrap();
+    assert!(am_explain("amt", "val = -500").contains("on amt_1"));
     let rebuilt = Spi::get_one::<i32>("SELECT table_range_summarize('amt_tr'::regclass)")
         .unwrap()
         .unwrap();
     assert_eq!(rebuilt, 3, "every leaf is rebuilt");
-    assert_eq!(e2e_same_on_off("amt", "val = 5000"), 0);
+    let summary = am_leaf_summary("amt_1");
+    assert!(
+        summary.contains("summarizing=false")
+            && summary.contains("min=Some(\"0\")")
+            && summary.contains("max=Some(\"99\")"),
+        "{summary}"
+    );
+    let plan = am_explain("amt", "val = -500");
+    assert!(!plan.contains("on amt_1"), "the rebuilt summary prunes again:\n{plan}");
     assert_eq!(e2e_same_on_off("amt", "val BETWEEN 0 AND 99"), 100);
 }
 
 #[pg_test]
 fn am_summarize_keeps_column_unbounded_while_value_exists() {
-    e2e_two_partitions("ub", "s text");
+    e2e_two_partitions("ub", "s text, n bigint");
     Spi::run(
-        "INSERT INTO ub VALUES (1, 'm'), (2, 'a');
-         CREATE INDEX ub_tr ON ub USING table_range (s);
-         INSERT INTO ub VALUES (1, 'z' || repeat('x', 9000));",
+        "INSERT INTO ub VALUES (1, 'm', 1), (2, 'a', 2);
+         CREATE INDEX ub_tr ON ub USING table_range (s, n);
+         INSERT INTO ub VALUES (1, 'z' || repeat('x', 9000), 3);",
     )
     .unwrap();
-    assert!(am_leaf_summary("ub_1").contains("unbounded=true"));
+    Spi::run(&format!(
+        "SELECT table_range_test_set_bounds({}, 3::int2, '-1000', '1000')",
+        am_leaf_index("ub_1")
+    ))
+    .unwrap();
     Spi::run("SELECT table_range_summarize('ub_tr'::regclass)").unwrap();
-    assert!(am_leaf_summary("ub_1").contains("unbounded=true"));
+    let summary = am_leaf_summary("ub_1");
+    assert!(
+        summary.contains("attnum=2 overlap=false min=None max=None")
+            && summary.contains("unbounded=true"),
+        "the oversized value still exists: {summary}"
+    );
+    assert!(
+        summary.contains("attnum=3 overlap=false min=Some(\"1\") max=Some(\"3\")"),
+        "the other column narrows: {summary}"
+    );
     assert_eq!(e2e_same_on_off("ub", "s > 'y'"), 1);
 }
 
 #[pg_test]
 fn am_summary_being_rebuilt_never_prunes() {
-    // A well-formed summary flagged as mid-rebuild, claiming val in [0, 0].
+    // Hand-written summaries claiming val in [0, 0]: an ordinary one prunes `val = 5`
+    // (the page lies, so nothing is found), one flagged mid-rebuild must not.
     Spi::run(
         "DROP TABLE IF EXISTS sb CASCADE;
          CREATE TABLE sb (val bigint);
          INSERT INTO sb VALUES (5);
-         CREATE INDEX sb_tr ON sb USING table_range (val);
-         SELECT table_range_test_write_blob('sb_tr'::regclass::oid,
-           '\x030101000100000000000000000400696e74380101003001010030');",
+         CREATE INDEX sb_tr ON sb USING table_range (val);",
     )
     .unwrap();
+    let write = |hex: &str| {
+        Spi::run(&format!(
+            "SELECT table_range_test_write_blob('sb_tr'::regclass::oid, '\\x{hex}')"
+        ))
+        .unwrap()
+    };
+    // ncols 1 | attnum 1 | minmax, no flags | collation 0 | "int8" | min "0" | max "0"
+    let body = "0100" .to_owned() + "0100" + "0000" + "00000000" + "0400696e7438" + "0101003001010030";
+    write(&format!("02{body}"));
+    e2e_set_pruning(true);
+    assert_eq!(e2e_count_in("sb", "val = 5"), 0, "the plain summary is used");
+    write(&format!("0301{body}"));
     assert_eq!(e2e_same_on_off("sb", "val = 5"), 1);
+}
+
+#[pg_test(error = "a column can appear only once in a table_range index")]
+fn am_column_indexed_twice_rejected() {
+    Spi::run(
+        "DROP TABLE IF EXISTS dc CASCADE;
+         CREATE TABLE dc (t text);
+         CREATE INDEX dc_tr ON dc USING table_range (t COLLATE \"C\", t COLLATE \"POSIX\");",
+    )
+    .unwrap();
 }
 
 #[pg_test]
@@ -302,13 +351,29 @@ fn am_oversized_value_makes_column_unbounded() {
     )
     .unwrap();
     assert_eq!(e2e_same_on_off("ov", "s > 'y'"), 1);
-    let summary = Spi::get_one::<String>(
-        "SELECT table_range_test_read_summary(i.indexrelid)
-         FROM pg_index i WHERE i.indrelid = 'ov_1'::regclass",
-    )
-    .unwrap()
-    .unwrap();
+    let summary = am_leaf_summary("ov_1");
     assert!(summary.contains("unbounded=true"), "{summary}");
+}
+
+#[pg_test]
+fn am_toasted_values_keep_exact_bounds() {
+    // Out-of-line values (~3 KB, uncompressed) are detoasted when kept as bounds.
+    e2e_two_partitions("lv", "s text");
+    Spi::run(
+        "ALTER TABLE lv ALTER COLUMN s SET STORAGE EXTERNAL;
+         INSERT INTO lv VALUES (1, 'm'), (2, 'm');
+         CREATE INDEX lv_tr ON lv USING table_range (s);
+         INSERT INTO lv SELECT 1, repeat(md5(g::text), 94) FROM generate_series(1, 50) g;",
+    )
+    .unwrap();
+    let (lo, hi) = Spi::get_two::<String, String>("SELECT min(s), max(s) FROM lv_1").unwrap();
+    let summary = am_leaf_summary("lv_1");
+    assert!(
+        summary.contains(&format!("min=Some({:?})", lo.unwrap()))
+            && summary.contains(&format!("max=Some({:?})", hi.unwrap())),
+        "bounds must equal the data's min and max"
+    );
+    e2e_same_on_off("lv", "s = repeat(md5('7'), 94)");
 }
 
 #[pg_test]
@@ -348,16 +413,21 @@ fn am_unknown_summary_format_is_ignored() {
 #[pg_test]
 fn am_one_statement_keeps_exact_bounds() {
     // Rows widen in both directions, interleaved with covered rows and NULLs, so the
-    // per-statement decoded bounds are both read and updated many times.
-    e2e_two_partitions("os", "n bigint, s text, r int4range");
+    // per-statement decoded bounds are both read and updated many times. `z` is all NULL
+    // when the index is built; `d` is a domain.
+    Spi::run("DROP DOMAIN IF EXISTS os_amount CASCADE; CREATE DOMAIN os_amount AS numeric;")
+        .unwrap();
+    e2e_two_partitions("os", "n bigint, s text, r int4range, z int, d os_amount");
     Spi::run(
-        "INSERT INTO os VALUES (1, 0, 'm', '[0,1)'), (2, 0, 'm', '[0,1)');
-         CREATE INDEX os_tr ON os USING table_range (n, s, r);
+        "INSERT INTO os VALUES (1, 0, 'm', '[0,1)', NULL, 0), (2, 0, 'm', '[0,1)', NULL, 0);
+         CREATE INDEX os_tr ON os USING table_range (n, s, r, z, d);
          INSERT INTO os
          SELECT 1,
                 CASE WHEN g % 7 = 0 THEN NULL ELSE (g * 37 % 1001) - 500 END,
                 CASE WHEN g % 5 = 0 THEN NULL ELSE chr(97 + g % 26) || g END,
-                int4range(g % 300 - 150, g % 300 - 140)
+                int4range(g % 300 - 150, g % 300 - 140),
+                CASE WHEN g % 3 = 0 THEN g % 97 END,
+                (g * 13 % 501) / 7.0 - 30
          FROM generate_series(1, 2000) g;",
     )
     .unwrap();
@@ -369,6 +439,11 @@ fn am_one_statement_keeps_exact_bounds() {
                        min(s COLLATE \"default\"), max(s COLLATE \"default\"))
                 || ' | ' ||
                 format('min=Some(\"%s\")', range_merge(range_agg(r)))
+                || ' | ' ||
+                format('min=Some(\"%s\") max=Some(\"%s\") has_nulls=true all_nulls=false',
+                       min(z), max(z))
+                || ' | ' ||
+                format('min=Some(\"%s\") max=Some(\"%s\")', min(d), max(d))
          FROM os_1",
     )
     .unwrap()

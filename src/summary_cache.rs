@@ -3,9 +3,7 @@
 // plan. Keyed by index OID; values are shared (`Rc`) with the per-plan cache.
 //
 // Correctness rests on the over-inclusive invariant: a cached summary is safe as long as
-// it is never *narrower* than the real data. Only `aminsert` widens a summary, and it
-// calls `note_widened`. Narrowing (deletes) needs no invalidation: an over-wide cached
-// summary still prunes correctly.
+// it is never *narrower* than the real data. Every page write calls `note_changed`.
 
 use crate::index_storage::ColSummary;
 use pgrx::pg_sys;
@@ -32,11 +30,23 @@ pub fn put(indexoid: pg_sys::Oid, summary: Rc<Vec<ColSummary>>) {
     });
 }
 
-/// The heap invalidation is what replans cached plans: they depend on tables, not indexes.
-/// Not deduplicated: PostgreSQL coalesces per command, and coarser dedup loses invalidations.
-pub unsafe fn note_widened(indexoid: pg_sys::Oid, heapoid: pg_sys::Oid) {
+/// Invalidates cached copies of the summary and cached plans on the heap (plans depend on
+/// tables, not indexes) in every backend.
+pub unsafe fn note_changed(indexoid: pg_sys::Oid, heapoid: pg_sys::Oid) {
+    // Transactional: reaches this backend at its next command.
     pg_sys::CacheInvalidateRelcacheByRelid(indexoid);
     pg_sys::CacheInvalidateRelcacheByRelid(heapoid);
+    // Immediate: the page write is not transactional, so other backends must hear of it
+    // even if this transaction aborts.
+    let message = |relid: pg_sys::Oid| pg_sys::SharedInvalidationMessage {
+        rc: pg_sys::SharedInvalRelcacheMsg {
+            id: pg_sys::SHAREDINVALRELCACHE_ID as i8,
+            dbId: pg_sys::MyDatabaseId,
+            relId: relid,
+        },
+    };
+    let messages = [message(indexoid), message(heapoid)];
+    pg_sys::SendSharedInvalidMessages(messages.as_ptr(), messages.len() as i32);
 }
 
 /// Relcache invalidation callback: drop the cached summary for `relid` (or all of them
