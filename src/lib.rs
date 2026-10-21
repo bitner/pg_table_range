@@ -7,6 +7,7 @@ use pgrx::{GucContext, GucFlags, GucRegistry};
 
 mod index_am;
 mod index_storage;
+mod pre_expansion;
 mod prune_hook;
 mod stable_io;
 mod summary_build;
@@ -16,6 +17,9 @@ mod summary_cache;
 pub(crate) static TABLE_RANGE_ENABLE_PRUNING: GucSetting<bool> = GucSetting::<bool>::new(true);
 /// Emit per-partition pruning decisions as debug log lines.
 pub(crate) static TABLE_RANGE_LOG_PRUNING_DEBUG: GucSetting<bool> = GucSetting::<bool>::new(false);
+/// Prune before partition expansion by injecting partition-key quals (experimental).
+pub(crate) static TABLE_RANGE_PRE_EXPANSION_PRUNING: GucSetting<bool> =
+    GucSetting::<bool>::new(false);
 
 #[cfg(not(test))]
 #[pg_guard]
@@ -34,6 +38,15 @@ pub extern "C-unwind" fn _PG_init() {
         c"Emit pruning diagnostics.",
         c"Logs per-partition prune/keep decisions for debugging.",
         &TABLE_RANGE_LOG_PRUNING_DEBUG,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_bool_guc(
+        c"table_range.pre_expansion_pruning",
+        c"Prune partitions before expansion (experimental).",
+        c"Injects partition-key quals so native pruning skips non-matching partitions.",
+        &TABLE_RANGE_PRE_EXPANSION_PRUNING,
         GucContext::Userset,
         GucFlags::default(),
     );

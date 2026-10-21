@@ -428,3 +428,18 @@ pub(crate) unsafe fn spi_value(sql: &str) -> Option<String> {
     }
     first_value()
 }
+
+/// First column of every row of a read-only statement on the current SPI connection.
+pub(crate) unsafe fn spi_column(sql: &str) -> Vec<Option<String>> {
+    let cmd = CString::new(sql).expect("SQL contains no NUL bytes");
+    if pg_sys::SPI_execute(cmd.as_ptr(), true, 0) != pg_sys::SPI_OK_SELECT as i32 {
+        error!("table_range: SPI_execute failed: {sql}");
+    }
+    let table = pg_sys::SPI_tuptable;
+    (0..pg_sys::SPI_processed as usize)
+        .map(|r| {
+            let p = pg_sys::SPI_getvalue(*(*table).vals.add(r), (*table).tupdesc, 1);
+            (!p.is_null()).then(|| CStr::from_ptr(p).to_string_lossy().into_owned())
+        })
+        .collect()
+}

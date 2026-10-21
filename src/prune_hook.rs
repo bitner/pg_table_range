@@ -6,7 +6,9 @@ use std::ffi::{CStr, CString};
 use std::rc::Rc;
 
 use crate::index_storage::ColSummary;
-use crate::{TABLE_RANGE_ENABLE_PRUNING, TABLE_RANGE_LOG_PRUNING_DEBUG};
+use crate::{
+    TABLE_RANGE_ENABLE_PRUNING, TABLE_RANGE_LOG_PRUNING_DEBUG, TABLE_RANGE_PRE_EXPANSION_PRUNING,
+};
 
 // Real planner-time partition pruning via `set_rel_pathlist_hook`, with a per-plan
 // summary cache driven by `planner_hook`.
@@ -196,6 +198,18 @@ unsafe extern "C-unwind" fn table_range_planner_hook(
     });
     if outermost {
         clear_cache();
+        if TABLE_RANGE_ENABLE_PRUNING.get() && TABLE_RANGE_PRE_EXPANSION_PRUNING.get() {
+            // Catalog queries inside must not re-enter the pruning hooks.
+            IN_HOOK.with(|f| f.set(true));
+            pgrx::PgTryBuilder::new(|| {
+                crate::stable_io::with_stable_io(|| {
+                    crate::pre_expansion::inject_partition_quals(parse)
+                })
+            })
+            .catch_others(|_| None)
+            .execute();
+            IN_HOOK.with(|f| f.set(false));
+        }
     }
 
     // Per-plan state points into planner memory: reset it even when planning errors.
@@ -385,7 +399,11 @@ unsafe fn evaluate_relation_inner(rel: *mut pg_sys::RelOptInfo, relid: pg_sys::O
 ///   - `AND(xs)` prunes if **any** child prunes,
 ///   - `OR(xs)`  prunes only if **every** child prunes,
 ///   - `NOT(..)` and unknown shapes are conservative (do not prune).
-unsafe fn clause_proves_prune(node: *mut pg_sys::Node, rows: &[ColSummary], depth: u32) -> bool {
+pub(crate) unsafe fn clause_proves_prune(
+    node: *mut pg_sys::Node,
+    rows: &[ColSummary],
+    depth: u32,
+) -> bool {
     if node.is_null() || depth > 32 {
         return false;
     }

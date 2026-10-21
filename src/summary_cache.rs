@@ -37,12 +37,34 @@ pub fn put(indexoid: pg_sys::Oid, summary: Rc<Vec<ColSummary>>) {
 pub unsafe fn note_widened(indexoid: pg_sys::Oid, heapoid: pg_sys::Oid) {
     pg_sys::CacheInvalidateRelcacheByRelid(indexoid);
     pg_sys::CacheInvalidateRelcacheByRelid(heapoid);
+    // Pre-expansion pruning leaves pruned leaves out of a plan, so its plans depend only
+    // on the ancestors.
+    if (*heap_rel(heapoid)).relispartition {
+        pg_sys::SPI_connect();
+        for ancestor in crate::summary_build::spi_column(&format!(
+            "SELECT relid::pg_catalog.oid FROM pg_catalog.pg_partition_ancestors({}) WHERE relid <> {0}",
+            u32::from(heapoid)
+        )) {
+            if let Some(oid) = ancestor.and_then(|t| t.parse::<u32>().ok()) {
+                pg_sys::CacheInvalidateRelcacheByRelid(pg_sys::Oid::from(oid));
+            }
+        }
+        pg_sys::SPI_finish();
+    }
+}
+
+unsafe fn heap_rel(relid: pg_sys::Oid) -> *mut pg_sys::FormData_pg_class {
+    let rel = pg_sys::RelationIdGetRelation(relid);
+    let form = (*rel).rd_rel;
+    pg_sys::RelationClose(rel);
+    form
 }
 
 /// Relcache invalidation callback: drop the cached summary for `relid` (or all of them
 /// when `relid` is invalid, PG's "flush everything" signal).
 #[pgrx::pg_guard]
 unsafe extern "C-unwind" fn relcache_callback(_arg: pg_sys::Datum, relid: pg_sys::Oid) {
+    crate::pre_expansion::invalidate(relid);
     if relid == pg_sys::Oid::INVALID {
         CACHE.with(|c| c.borrow_mut().clear());
     } else {
