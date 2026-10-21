@@ -158,8 +158,12 @@ EXPLAIN (COSTS OFF) SELECT * FROM places WHERE geom && ST_MakeEnvelope(0,0,10,10
   value, but is never too narrow. Pruning therefore stays correct **and** active across
   inserts without any rebuild. Deletes only shrink a partition's true range, leaving the
   summary conservatively wide (still safe); `REINDEX` re-tightens it once the deleted rows
-  are no longer visible to any transaction (`VACUUM` does not). `DROP INDEX` removes the
-  summary with the index's storage — there is no side table to clean up.
+  are no longer visible to any transaction. `DROP INDEX` removes the summary with the
+  index's storage — there is no side table to clean up.
+- **Re-summarizing.** `table_range_summarize` rebuilds summaries from the data without
+  blocking inserts (like BRIN summarization), re-tightening bounds after deletes. `VACUUM`
+  does the same for any summary with an unbounded column, e.g. once an oversized value has
+  been deleted.
 
 ## Performance
 
@@ -200,9 +204,9 @@ natively) and `nk` (the same values, not the key, pruned by table_range):
 Native pruning is *hundreds of times* cheaper to plan and is effectively constant in the
 partition count. table_range cannot match that (see
 [Scaling](#scaling-and-partition-count)): its job is the case native pruning **can't** do
-— eliminating partitions by a non-key column. table_range's own cost is within measurement
-noise of the no-pruning baseline: nearly all of the ~15 ms is PostgreSQL expanding 2,000
-partitions.
+— eliminating partitions by a non-key column. table_range's own cost is small next to the
+no-pruning baseline (0–3 ms across runs, under 1.5 µs per partition): nearly all of the
+~15 ms is PostgreSQL expanding 2,000 partitions.
 
 **Comparison to `CHECK` constraint exclusion.** The built-in way to prune on a non-key
 column is to put a data-range `CHECK (col BETWEEN lo AND hi)` on each partition and let the
@@ -238,6 +242,19 @@ avoids everything `CHECK` constraints make you give up:
    only ever *widens* a summary, and when it does it invalidates the cached copy (and
    cached plans on that partition) everywhere — so a cached summary is never narrower than
    reality. A cold first plan still reads each page.
+
+**Insert cost.** 100,000 rows in one `INSERT … SELECT` into one partition:
+
+| | Time | WAL |
+|---|---|---|
+| no index | ~45–52 ms | 7.9 MB |
+| table_range, values inside the summary's bounds | ~88 ms | 7.9 MB |
+| table_range, ascending values (every row widens the summary) | ~280 ms | 13.3 MB |
+
+Within a statement each partition's summary is decoded once, so a row inside the bounds
+costs a page read and a comparison (~0.4 µs) and writes nothing. A row that widens the
+summary costs ~2.3 µs and ~55 bytes of WAL. Every transaction that widens a summary also
+invalidates cached plans on that partition (see [Limitations](#limitations)).
 
 ## Scaling and partition count
 
@@ -283,7 +300,8 @@ Two practical consequences and how to handle them:
   thousands of partitions; each lock slot costs only a few hundred bytes of shared memory.
 - **Planning time grows with partition count.** Even below the lock wall, planning scales
   linearly, dominated by PostgreSQL's own partition expansion (~15 ms for 2,000 partitions
-  in the benchmark above); table_range's evaluation adds little on top. **Mitigations:** prefer **fewer, larger partitions** (table_range's
+  in the benchmark above); table_range's evaluation adds little on top. **Mitigations:**
+  prefer **fewer, larger partitions** (table_range's
   sweet spot — the execution win is biggest there anyway); use **prepared statements** so a
   plan is reused across executions; and where you can, **align the hot filter column with
   the partition key** so native pruning handles it.
@@ -316,14 +334,20 @@ Everything not listed is conservatively **kept** (never mispruned):
 - `table_range.enable_pruning` (default `on`) — master switch.
 - `table_range.log_pruning_debug` (default `off`) — log each prune decision.
 
+`SELECT table_range_summarize('index'::regclass)` rebuilds every summary of a table_range
+index (each leaf of a partitioned index) from the data and returns how many it rebuilt.
+It takes `ShareUpdateExclusiveLock` on each partition in turn, so inserts continue; it
+requires owning the table.
+
 ## Storage
 
 There is no catalog table — each partition's summary lives on its `table_range` index's
 metapage (block 0), written by `ambuild` and updated in place by `aminsert`, like BRIN.
 Bounds are stored as each type's text form, written and read with the type I/O settings
 that affect it (`DateStyle`, `IntervalStyle`, `extra_float_digits`) pinned to
-round-trip-exact values. The on-page format is versioned: a summary in any other format
-version is never used for pruning until `REINDEX` rebuilds it.
+round-trip-exact values. The on-page format is versioned: version 3 is written, version 2 is
+still read, and a summary in an older format is never used for pruning until `REINDEX`
+rebuilds it.
 
 ## Project layout
 
@@ -333,6 +357,7 @@ version is never used for pruning until `REINDEX` rebuilds it.
 | `src/index_storage.rs` | per-index summary on the metapage: page I/O (Generic WAL) + (de)serialization |
 | `src/summary_build.rs` | build a leaf's summary by scanning its data (used by `ambuild`) |
 | `src/prune_hook.rs` | planner + pathlist hooks, per-plan compilation cache, typed in-memory evaluation |
+| `src/summarize.rs` | rebuilds summaries (VACUUM, `table_range_summarize`) without blocking inserts |
 | `src/summary_cache.rs` | backend-lifetime per-index summary cache + relcache-invalidation coherence |
 | `src/stable_io.rs` | pins the GUCs that change a type's text form while summaries are written or read |
 | `src/index_am.rs` | `table_range` index AM: build, incremental `aminsert` widening, opclass provisioning |
@@ -409,9 +434,9 @@ the published tarball via `.gitattributes`.
 - Inserts keep summaries current incrementally, but deletes only relax them (the summary
   can stay wider than the live data until a `REINDEX` re-tightens it) — always correct,
   just potentially less selective.
-- Every insert that widens a summary writes a full metapage image to WAL and invalidates
-  cached plans on that partition. Append-only workloads whose values keep growing (e.g.
-  timestamps) widen on nearly every insert.
+- Every transaction that widens a summary invalidates cached plans on that partition in
+  every backend (a widening's WAL is small, but plans are replanned). Append-only
+  workloads whose values keep growing (e.g. timestamps) widen on most inserts.
 - Pruning is decided when a query is planned. Under `READ COMMITTED`, an insert that
   widens a summary and commits after a query is planned but before it starts executing
   can be missed by that one execution (cached plans are replanned once the widening

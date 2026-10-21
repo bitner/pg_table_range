@@ -54,10 +54,13 @@ struct BuildState {
     cxt: pg_sys::MemoryContext,
 }
 
+/// `include_in_progress`: the heap is not locked against writers, so rows of in-progress
+/// inserts must be covered too.
 pub(crate) unsafe fn build_leaf_summary(
     heap: pg_sys::Relation,
     index: pg_sys::Relation,
     index_info: *mut pg_sys::IndexInfo,
+    include_in_progress: bool,
 ) -> LeafBuild {
     let build_cxt = PgMemoryContexts::new("table_range build");
     let cxt = build_cxt.value();
@@ -73,9 +76,9 @@ pub(crate) unsafe fn build_leaf_summary(
         heap,
         index,
         index_info,
-        true,  // allow_sync
-        false, // anyvisible
-        true,  // progress
+        true, // allow_sync
+        include_in_progress,
+        !include_in_progress, // progress: only a CREATE INDEX / REINDEX reports it
         0,
         pg_sys::InvalidBlockNumber,
         Some(build_callback),
@@ -352,7 +355,11 @@ unsafe fn call_cmp(
     pg_sys::FunctionCall2Coll(cmp, collation, a, b).value() as i32
 }
 
-unsafe fn copy_datum(value: pg_sys::Datum, typlen: i16, typbyval: bool) -> pg_sys::Datum {
+pub(crate) unsafe fn copy_datum(
+    value: pg_sys::Datum,
+    typlen: i16,
+    typbyval: bool,
+) -> pg_sys::Datum {
     if typbyval {
         value
     } else if typlen == -1 {
@@ -365,7 +372,7 @@ unsafe fn copy_datum(value: pg_sys::Datum, typlen: i16, typbyval: bool) -> pg_sy
     }
 }
 
-unsafe fn free_datum(value: pg_sys::Datum, typbyval: bool) {
+pub(crate) unsafe fn free_datum(value: pg_sys::Datum, typbyval: bool) {
     if !typbyval {
         pg_sys::pfree(value.cast_mut_ptr());
     }
@@ -427,4 +434,19 @@ pub(crate) unsafe fn spi_value(sql: &str) -> Option<String> {
         error!("table_range: SPI_execute failed ({rc}): {sql}");
     }
     first_value()
+}
+
+/// First column of every row of a read-only statement on the current SPI connection.
+pub(crate) unsafe fn spi_column(sql: &str) -> Vec<Option<String>> {
+    let cmd = CString::new(sql).expect("SQL contains no NUL bytes");
+    if pg_sys::SPI_execute(cmd.as_ptr(), true, 0) != pg_sys::SPI_OK_SELECT as i32 {
+        error!("table_range: SPI_execute failed: {sql}");
+    }
+    let table = pg_sys::SPI_tuptable;
+    (0..pg_sys::SPI_processed as usize)
+        .map(|r| {
+            let p = pg_sys::SPI_getvalue(*(*table).vals.add(r), (*table).tupdesc, 1);
+            (!p.is_null()).then(|| CStr::from_ptr(p).to_string_lossy().into_owned())
+        })
+        .collect()
 }

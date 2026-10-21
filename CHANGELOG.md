@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.2.0
+
+Upgrade with `ALTER EXTENSION pg_table_range UPDATE;`. Summaries written by 0.1.2 are
+read as they are, so no `REINDEX` is needed.
+
+- Widening a summary on insert writes a small WAL record (the changed bytes) instead of a
+  full page image: ~55 bytes instead of ~8.4 KB per widening row.
+- Inserts decode each partition's summary once per statement: a row inside the bounds
+  costs ~0.4 µs instead of ~14 µs, and a widening row ~2.3 µs.
+- New `table_range_summarize(index)` rebuilds summaries from the data without blocking
+  inserts, re-tightening bounds after deletes. `VACUUM` rebuilds summaries that have an
+  unbounded column (e.g. after an oversized value is deleted).
+- Summaries are written in on-page format version 3; version 2 is still read.
+
 ## 0.1.2
 
 A correctness release. 0.1.1 could return wrong results (rows missing from query

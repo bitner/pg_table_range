@@ -7,6 +7,8 @@
 --   1. Plan-vs-execution tradeoff: a selective non-key predicate, pruning on vs. off.
 --   2. Honest comparison to native partition pruning: two identical columns, one the
 --      partition key (pruned natively) and one not (pruned by table_range).
+--   3. Comparison to CHECK constraint exclusion.
+--   4. Insert cost (time and WAL), with and without a table_range index.
 --
 -- The script drops and recreates the extension for a clean baseline.
 
@@ -120,7 +122,40 @@ EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF) SELECT count(*) FROM bench_c WHERE nk =
 DROP TABLE bench_c CASCADE;
 
 -- ====================================================================================
--- 4. (Optional) The lock-table wall. At ~10,000 partitions a non-key predicate exhausts
+-- 4. Insert cost: 100,000 rows into one partition, with and without a table_range index.
+--    Ascending rows extend the summary on every row (like time-series appends); in-range
+--    rows fall inside the existing bounds and write nothing to the index.
+-- ====================================================================================
+DROP TABLE IF EXISTS bench_d, bench_d_plain CASCADE;
+CREATE TABLE bench_d (k int, n bigint, ts timestamptz) PARTITION BY LIST (k);
+CREATE TABLE bench_d_1 PARTITION OF bench_d FOR VALUES IN (1);
+CREATE TABLE bench_d_plain (LIKE bench_d) PARTITION BY LIST (k);
+CREATE TABLE bench_d_plain_1 PARTITION OF bench_d_plain FOR VALUES IN (1);
+INSERT INTO bench_d VALUES (1, 0, '2024-01-01'), (1, 1000000, '2025-01-01');
+INSERT INTO bench_d_plain VALUES (1, 0, '2024-01-01'), (1, 1000000, '2025-01-01');
+CREATE INDEX bench_d_tr ON bench_d USING table_range (n, ts);
+CHECKPOINT;
+
+\echo '==== D: 100k ascending rows, no index ===='
+EXPLAIN (ANALYZE, WAL, COSTS OFF, TIMING OFF)
+INSERT INTO bench_d_plain
+SELECT 1, 1000000 + g, '2025-01-01'::timestamptz + g * interval '1 s'
+FROM generate_series(1, 100000) g;
+\echo '==== D: 100k ascending rows, table_range (widens every row) ===='
+EXPLAIN (ANALYZE, WAL, COSTS OFF, TIMING OFF)
+INSERT INTO bench_d
+SELECT 1, 1000000 + g, '2025-01-01'::timestamptz + g * interval '1 s'
+FROM generate_series(1, 100000) g;
+\echo '==== D: 100k in-range rows, no index ===='
+EXPLAIN (ANALYZE, WAL, COSTS OFF, TIMING OFF)
+INSERT INTO bench_d_plain SELECT 1, g, '2024-06-01' FROM generate_series(1, 100000) g;
+\echo '==== D: 100k in-range rows, table_range ===='
+EXPLAIN (ANALYZE, WAL, COSTS OFF, TIMING OFF)
+INSERT INTO bench_d SELECT 1, g, '2024-06-01' FROM generate_series(1, 100000) g;
+DROP TABLE bench_d, bench_d_plain CASCADE;
+
+-- ====================================================================================
+-- 5. (Optional) The lock-table wall. At ~10,000 partitions a non-key predicate exhausts
 --    the lock table on default settings:
 --      ERROR: out of shared memory
 --      HINT:  You might need to increase "max_locks_per_transaction".

@@ -109,6 +109,66 @@ for v in 100 -100 200 -200 300 -300; do
     check "concurrent widening to $v kept" "cc WHERE r && '[$v,$((v + 1)))'::slowrange"
 done
 
+# Assert how many partitions a query scans with pruning on.
+expect_scans() {
+    local label=$1 from_where=$2 want=$3 got
+    got=$(q -c "SET table_range.enable_pruning = on" \
+        -c "EXPLAIN (COSTS OFF) SELECT * FROM $from_where" | grep -c "Scan on" || true)
+    if [[ "$got" == "$want" ]]; then
+        echo "ok   $label (scans $got)"
+    else
+        echo "FAIL $label: scans $got partitions, want $want"
+        failures=$((failures + 1))
+    fi
+}
+
+# 4. A bulk load keeps the partition pruning. A column made unbounded by an oversized
+#    value is restored by VACUUM once that row is deleted, and table_range_summarize
+#    re-tightens bounds after committed deletes.
+q <<'SQL'
+CREATE TABLE vb (k int, n bigint, s text) PARTITION BY LIST (k);
+CREATE TABLE vb_1 PARTITION OF vb FOR VALUES IN (1);
+CREATE TABLE vb_2 PARTITION OF vb FOR VALUES IN (2);
+INSERT INTO vb VALUES (1, 0, 'm'), (2, 1000, 'm');
+CREATE INDEX vb_tr ON vb USING table_range (n, s);
+INSERT INTO vb SELECT 1, g, 'm' FROM generate_series(1, 200) g;
+SQL
+expect_scans "bulk-loaded partition still prunes" "vb WHERE n = 5000" 0
+q -c "INSERT INTO vb VALUES (1, 50, 'z' || repeat('x', 9000))"
+expect_scans "oversized value keeps its partition" "vb WHERE s = 'zz'" 1
+q -c "DELETE FROM vb WHERE length(s) > 100"
+q -c "VACUUM vb"
+expect_scans "VACUUM restores the bounds once it is deleted" "vb WHERE s = 'zz'" 0
+q -c "DELETE FROM vb WHERE k = 1 AND n > 100"
+q -c "SELECT table_range_summarize('vb_tr'::regclass)" >/dev/null
+expect_scans "table_range_summarize re-tightens after deletes" "vb WHERE n = 150" 0
+check "rows after re-summarizing" "vb WHERE n BETWEEN 0 AND 200"
+
+# 5. Rows inserted while a re-summarization scans the heap must be covered, including
+#    rows that land on pages the scan has already passed. The expression column is not
+#    summarized; it only makes every scan slow (~2 ms per row). Freed space on the first
+#    pages routes the concurrent inserts behind the scan.
+q <<'SQL'
+CREATE FUNCTION slow_id(bigint) RETURNS bigint LANGUAGE plpgsql IMMUTABLE
+    AS $$ BEGIN PERFORM pg_sleep(0.002); RETURN $1; END $$;
+CREATE TABLE rs (k int, n bigint) PARTITION BY LIST (k);
+CREATE TABLE rs_1 PARTITION OF rs FOR VALUES IN (1);
+INSERT INTO rs SELECT 1, g FROM generate_series(1, 1000) g;
+CREATE INDEX rs_tr ON rs USING table_range (n, (slow_id(n)));
+DELETE FROM rs WHERE n <= 220;
+VACUUM rs;
+INSERT INTO rs SELECT 1, g FROM generate_series(2000, 2100) g;
+SQL
+q -c "SELECT table_range_summarize('rs_tr'::regclass)" >/dev/null &
+summarizer=$!
+sleep 0.8
+q -c "INSERT INTO rs VALUES (1, 50000)"
+q -c "INSERT INTO rs VALUES (1, -50000)"
+wait "$summarizer"
+check "insert above the range during re-summarization" "rs WHERE n = 50000"
+check "insert below the range during re-summarization" "rs WHERE n = -50000"
+expect_scans "re-summarized partition prunes" "rs WHERE n = 999999" 0
+
 if ((failures > 0)); then
     echo "$failures multi-session check(s) failed"
     exit 1

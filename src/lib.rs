@@ -7,8 +7,10 @@ use pgrx::{GucContext, GucFlags, GucRegistry};
 
 mod index_am;
 mod index_storage;
+mod insert_cache;
 mod prune_hook;
 mod stable_io;
+mod summarize;
 mod summary_build;
 mod summary_cache;
 

@@ -30,12 +30,10 @@ unsafe fn page_blob(page: pg_sys::Page) -> Option<Vec<u8>> {
     Some(data)
 }
 
-// shortcut: logs a full page image per write (~8 KB WAL per widening); log a delta once
-// pd_lower marks the end of the data, if insert-heavy workloads need less WAL.
 unsafe fn put_blob(index: pg_sys::Relation, buffer: pg_sys::Buffer, is_new: bool, data: &[u8]) {
     let state = pg_sys::GenericXLogStart(index);
-    let page =
-        pg_sys::GenericXLogRegisterBuffer(state, buffer, pg_sys::GENERIC_XLOG_FULL_IMAGE as i32);
+    // Delta mode: a widening logs the bytes that changed, not the whole page.
+    let page = pg_sys::GenericXLogRegisterBuffer(state, buffer, 0);
     if is_new || pg_sys::PageIsNew(page) {
         pg_sys::PageInit(page, pg_sys::BLCKSZ as usize, 0);
     }
@@ -45,11 +43,10 @@ unsafe fn put_blob(index: pg_sys::Relation, buffer: pg_sys::Buffer, is_new: bool
     std::ptr::copy_nonoverlapping(len.to_ne_bytes().as_ptr(), contents, 4);
     std::ptr::copy_nonoverlapping(data.as_ptr(), contents.add(4), data.len());
 
-    // Eliminate the page "hole": Generic WAL (and standard page logging) treats the
-    // region between pd_lower and pd_upper as empty and zeroes it, which would clobber
-    // our content. Setting pd_lower = pd_upper means the whole page is logged verbatim.
+    // WAL replay zeroes the "hole" between pd_lower and pd_upper, so pd_lower must cover
+    // the data.
     let header = page as *mut pg_sys::PageHeaderData;
-    (*header).pd_lower = (*header).pd_upper;
+    (*header).pd_lower = (contents.add(4 + data.len()) as usize - page as usize) as u16;
 
     pg_sys::GenericXLogFinish(state);
 }
@@ -143,10 +140,16 @@ impl ColSummary {
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct IndexSummary {
     pub cols: Vec<ColSummary>,
+    /// Mid-rebuild: `cols` holds only values inserted since it started, so never prune.
+    pub summarizing: bool,
 }
 
-// Other format versions are unreadable on purpose: they may not cover their data.
-const SUMMARY_VERSION: u8 = 2;
+// Formats older than version 2 are unreadable on purpose: they may not cover their data.
+const SUMMARY_VERSION: u8 = 3;
+/// Version 2 is version 3 without the header flags byte.
+const OLDEST_READABLE_VERSION: u8 = 2;
+
+const HEADER_SUMMARIZING: u8 = 1;
 
 const FLAG_HAS_NULLS: u8 = 1;
 const FLAG_ALL_NULLS: u8 = 2;
@@ -208,6 +211,11 @@ impl Reader<'_> {
 pub fn serialize(summary: &IndexSummary) -> Vec<u8> {
     let mut out = Vec::new();
     out.push(SUMMARY_VERSION);
+    out.push(if summary.summarizing {
+        HEADER_SUMMARIZING
+    } else {
+        0
+    });
     out.extend_from_slice(&(summary.cols.len() as u16).to_le_bytes());
     for c in &summary.cols {
         out.extend_from_slice(&c.attnum.to_le_bytes());
@@ -233,9 +241,11 @@ pub fn serialize(summary: &IndexSummary) -> Vec<u8> {
 
 pub fn deserialize(buf: &[u8]) -> Option<IndexSummary> {
     let mut r = Reader { buf, pos: 0 };
-    if r.u8()? != SUMMARY_VERSION {
-        return None;
-    }
+    let header = match r.u8()? {
+        SUMMARY_VERSION => r.u8()?,
+        OLDEST_READABLE_VERSION => 0,
+        _ => return None,
+    };
     let ncols = r.u16()? as usize;
     let mut cols = Vec::with_capacity(ncols);
     for _ in 0..ncols {
@@ -258,7 +268,10 @@ pub fn deserialize(buf: &[u8]) -> Option<IndexSummary> {
             unbounded: flags & FLAG_UNBOUNDED != 0,
         });
     }
-    Some(IndexSummary { cols })
+    Some(IndexSummary {
+        cols,
+        summarizing: header & HEADER_SUMMARIZING != 0,
+    })
 }
 
 /// Drops the largest columns' bounds until it fits: less selective, never too narrow.
@@ -349,8 +362,21 @@ mod serde_tests {
                     ..col(4, "", "")
                 },
             ],
+            summarizing: true,
         };
         assert_eq!(deserialize(&serialize(&s)), Some(s));
+    }
+
+    #[test]
+    fn reads_version_2() {
+        let s = IndexSummary {
+            cols: vec![col(1, "a", "b")],
+            summarizing: false,
+        };
+        let mut v2 = serialize(&s);
+        v2.remove(1); // version 2 has no header flags byte
+        v2[0] = 2;
+        assert_eq!(deserialize(&v2), Some(s));
     }
 
     #[test]
@@ -360,6 +386,7 @@ mod serde_tests {
         // Another format version is never trusted, even if well-formed.
         let mut v1 = serialize(&IndexSummary {
             cols: vec![col(1, "a", "b")],
+            summarizing: false,
         });
         v1[0] = 1;
         assert_eq!(deserialize(&v1), None);
@@ -370,6 +397,7 @@ mod serde_tests {
         let big = "x".repeat(max_blob_len());
         let mut s = IndexSummary {
             cols: vec![col(1, "a", "b"), col(2, "a", &big)],
+            summarizing: false,
         };
         let bytes = encode_fitting(&mut s);
         assert!(bytes.len() <= max_blob_len());

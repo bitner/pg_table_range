@@ -336,7 +336,12 @@ unsafe fn read_index_summary(rel: *mut pg_sys::RelOptInfo) -> Rc<Vec<ColSummary>
             None
         };
         pg_sys::index_close(irel, pg_sys::AccessShareLock as i32);
-        let cols = Rc::new(summary.map(|s| s.cols).unwrap_or_default());
+        let cols = Rc::new(
+            summary
+                .filter(|s| !s.summarizing)
+                .map(|s| s.cols)
+                .unwrap_or_default(),
+        );
         crate::summary_cache::put(indexoid, Rc::clone(&cols));
         return cols;
     }

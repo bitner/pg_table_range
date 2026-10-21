@@ -1,4 +1,5 @@
 use crate::index_storage::{self, ColSummary};
+use crate::insert_cache::InsertCache;
 use crate::prune_hook::{btree_cmp_proc, datum_cmp, datum_to_text, text_to_datum};
 use crate::stable_io::with_stable_io;
 use crate::summary_build::{geometry_schema, spi_value};
@@ -71,7 +72,7 @@ unsafe extern "C-unwind" fn am_build(
         );
     }
 
-    let mut built = crate::summary_build::build_leaf_summary(heap, index, index_info);
+    let mut built = crate::summary_build::build_leaf_summary(heap, index, index_info, false);
     index_storage::write_summary(index, &mut built.summary).unwrap_or_else(|e| error!("{e}"));
 
     let result = pg_sys::palloc0(std::mem::size_of::<pg_sys::IndexBuildResult>())
@@ -115,20 +116,33 @@ unsafe fn widen_on_insert(
     values: *mut pg_sys::Datum,
     isnull: *mut bool,
 ) {
+    let cache = crate::insert_cache::slot(index_info);
     loop {
         pgrx::check_for_interrupts!();
         // No summary, or an unreadable one: the planner never prunes with it.
         let Some(before) = index_storage::read_blob(index) else {
             return;
         };
+        if !cache.as_ref().is_some_and(|c| c.matches(&before)) {
+            let Some(summary) = index_storage::deserialize(&before) else {
+                return;
+            };
+            *cache = Some(
+                with_stable_io(|| InsertCache::decode(before.clone(), &summary, index, index_info))
+                    .unwrap_or_else(|| {
+                        error!("table_range: cannot maintain a summary in parallel mode")
+                    }),
+            );
+        }
+        let decoded = cache.as_mut().expect("decoded above");
+        if decoded.covers(values, isnull) {
+            return;
+        }
         let Some(mut summary) = index_storage::deserialize(&before) else {
             return;
         };
-        let changed =
-            with_stable_io(|| widen_summary(&mut summary, index, index_info, values, isnull))
-                .unwrap_or_else(|| {
-                    error!("table_range: cannot maintain a summary in parallel mode")
-                });
+        let changed = with_stable_io(|| decoded.widen(&mut summary, values, isnull))
+            .unwrap_or_else(|| error!("table_range: cannot maintain a summary in parallel mode"));
         if !changed {
             return;
         }
@@ -136,36 +150,37 @@ unsafe fn widen_on_insert(
         if index_storage::replace_blob_if(index, &before, &after).unwrap_or_else(|e| error!("{e}"))
         {
             crate::summary_cache::note_widened((*index).rd_id, (*heap).rd_id);
+            decoded.absorb(after, &summary, values, isnull);
             return;
         }
         // Changed by another backend since we read it: retry.
     }
 }
 
-unsafe fn widen_summary(
-    summary: &mut index_storage::IndexSummary,
+pub(crate) struct IndexColumn {
+    /// Position among the index's columns.
+    pub pos: usize,
+    pub attnum: i16,
+    pub typ: pg_sys::Oid,
+    pub collation: pg_sys::Oid,
+}
+
+pub(crate) unsafe fn index_columns(
     index: pg_sys::Relation,
     index_info: *mut pg_sys::IndexInfo,
-    values: *mut pg_sys::Datum,
-    isnull: *mut bool,
-) -> bool {
-    let nattrs = (*index_info).ii_NumIndexAttrs.max(0) as usize;
-    let mut changed = false;
-    for i in 0..nattrs {
-        let heap_attnum = (*index_info).ii_IndexAttrNumbers[i];
-        let col = match summary.cols.iter_mut().find(|c| c.attnum == heap_attnum) {
-            Some(c) => c,
-            None => continue,
-        };
-        let typoid = att_typid((*index).rd_att, i);
-        let collation = if (*index).rd_indcollation.is_null() {
-            pg_sys::Oid::INVALID
-        } else {
-            *(*index).rd_indcollation.add(i)
-        };
-        changed |= widen_column(col, typoid, collation, *values.add(i), *isnull.add(i));
-    }
-    changed
+) -> Vec<IndexColumn> {
+    (0..(*index_info).ii_NumIndexAttrs.max(0) as usize)
+        .map(|pos| IndexColumn {
+            pos,
+            attnum: (*index_info).ii_IndexAttrNumbers[pos],
+            typ: att_typid((*index).rd_att, pos),
+            collation: if (*index).rd_indcollation.is_null() {
+                pg_sys::Oid::INVALID
+            } else {
+                *(*index).rd_indcollation.add(pos)
+            },
+        })
+        .collect()
 }
 /// The type OID of a tuple descriptor's `i`-th attribute, portable across PG versions.
 /// PG18 made `TupleDescAttr` an inline function (bound by pgrx) and moved attributes to
@@ -183,7 +198,7 @@ pub(crate) unsafe fn att_typid(tupdesc: pg_sys::TupleDesc, i: usize) -> pg_sys::
 
 /// Returns whether the summary changed. A value that cannot be folded in makes the column
 /// unbounded rather than leaving it too narrow.
-unsafe fn widen_column(
+pub(crate) unsafe fn widen_column(
     col: &mut ColSummary,
     typoid: pg_sys::Oid,
     collation: pg_sys::Oid,
@@ -326,10 +341,19 @@ unsafe extern "C-unwind" fn am_bulkdelete(
 }
 
 #[pg_guard]
+/// Re-summarizes an unbounded summary (e.g. once an oversized value is deleted).
 unsafe extern "C-unwind" fn am_vacuumcleanup(
-    _info: *mut pg_sys::IndexVacuumInfo,
+    info: *mut pg_sys::IndexVacuumInfo,
     stats: *mut pg_sys::IndexBulkDeleteResult,
 ) -> *mut pg_sys::IndexBulkDeleteResult {
+    // shortcut: skipped under VACUUM (PARALLEL); run table_range_summarize() instead.
+    if !info.is_null()
+        && !(*info).analyze_only
+        && !(*info).heaprel.is_null()
+        && !pg_sys::IsInParallelMode()
+    {
+        crate::summarize::resummarize((*info).index, (*info).heaprel, true);
+    }
     stats
 }
 

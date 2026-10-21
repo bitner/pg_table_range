@@ -98,29 +98,80 @@ fn am_insert_then_correct_without_rebuild() {
     );
 }
 
+/// The summary of a leaf's table_range index, rendered by `table_range_test_read_summary`.
+fn am_leaf_summary(leaf: &str) -> String {
+    Spi::get_one::<String>(&format!(
+        "SELECT table_range_test_read_summary(i.indexrelid)
+         FROM pg_index i WHERE i.indrelid = '{leaf}'::regclass"
+    ))
+    .unwrap()
+    .unwrap()
+}
+
 #[pg_test]
 fn am_bulk_insert_widens_summary() {
     am_setup();
-    Spi::run("CREATE INDEX amt_tr ON amt USING table_range (val)").unwrap();
-    Spi::run("SET table_range.enable_pruning = on").unwrap();
+    Spi::run(
+        "CREATE INDEX amt_tr ON amt USING table_range (val);
+         INSERT INTO amt SELECT 1, g FROM generate_series(1000, 1099) g;",
+    )
+    .unwrap();
+    let summary = am_leaf_summary("amt_1");
+    assert!(
+        summary.contains("max=Some(\"1099\")") && summary.contains("unbounded=false"),
+        "{summary}"
+    );
+    assert_eq!(e2e_same_on_off("amt", "val BETWEEN 1000 AND 1099"), 100);
+    // EXPLAIN aliases partitions (`amt_3 amt_2`), so match the scanned table name.
+    let plan = am_explain("amt", "val > 1500");
+    assert!(!plan.contains("on amt_1"), "a widened leaf still prunes:\n{plan}");
+}
 
-    // Bulk insert many out-of-range rows into r1 in one statement. Each row widens the
-    // summary as needed, so all of them are found.
-    Spi::run("INSERT INTO amt SELECT 1, g FROM generate_series(1000, 1099) g").unwrap();
-    assert_eq!(
-        Spi::get_one::<i64>("SELECT count(*)::bigint FROM amt WHERE val BETWEEN 1000 AND 1099")
-            .unwrap()
-            .unwrap(),
-        100,
-        "widened summary must cover bulk-inserted rows"
-    );
-    // A predicate matching r3's data still works (no over-pruning).
-    assert_eq!(
-        Spi::get_one::<i64>("SELECT count(*)::bigint FROM amt WHERE val = 250")
-            .unwrap()
-            .unwrap(),
-        1
-    );
+#[pg_test]
+fn am_summarize_rebuilds_every_leaf() {
+    am_setup();
+    Spi::run(
+        "CREATE INDEX amt_tr ON amt USING table_range (val);
+         INSERT INTO amt VALUES (1, 5000);
+         DELETE FROM amt WHERE val = 5000;",
+    )
+    .unwrap();
+    let rebuilt = Spi::get_one::<i32>("SELECT table_range_summarize('amt_tr'::regclass)")
+        .unwrap()
+        .unwrap();
+    assert_eq!(rebuilt, 3, "every leaf is rebuilt");
+    assert_eq!(e2e_same_on_off("amt", "val = 5000"), 0);
+    assert_eq!(e2e_same_on_off("amt", "val BETWEEN 0 AND 99"), 100);
+}
+
+#[pg_test]
+fn am_summarize_keeps_column_unbounded_while_value_exists() {
+    e2e_two_partitions("ub", "s text");
+    Spi::run(
+        "INSERT INTO ub VALUES (1, 'm'), (2, 'a');
+         CREATE INDEX ub_tr ON ub USING table_range (s);
+         INSERT INTO ub VALUES (1, 'z' || repeat('x', 9000));",
+    )
+    .unwrap();
+    assert!(am_leaf_summary("ub_1").contains("unbounded=true"));
+    Spi::run("SELECT table_range_summarize('ub_tr'::regclass)").unwrap();
+    assert!(am_leaf_summary("ub_1").contains("unbounded=true"));
+    assert_eq!(e2e_same_on_off("ub", "s > 'y'"), 1);
+}
+
+#[pg_test]
+fn am_summary_being_rebuilt_never_prunes() {
+    // A well-formed summary flagged as mid-rebuild, claiming val in [0, 0].
+    Spi::run(
+        "DROP TABLE IF EXISTS sb CASCADE;
+         CREATE TABLE sb (val bigint);
+         INSERT INTO sb VALUES (5);
+         CREATE INDEX sb_tr ON sb USING table_range (val);
+         SELECT table_range_test_write_blob('sb_tr'::regclass::oid,
+           '\x030101000100000000000000000400696e74380101003001010030');",
+    )
+    .unwrap();
+    assert_eq!(e2e_same_on_off("sb", "val = 5"), 1);
 }
 
 #[pg_test]
@@ -292,4 +343,41 @@ fn am_unknown_summary_format_is_ignored() {
     )
     .unwrap();
     assert_eq!(e2e_same_on_off("fmt", "val = 5"), 1);
+}
+
+#[pg_test]
+fn am_one_statement_keeps_exact_bounds() {
+    // Rows widen in both directions, interleaved with covered rows and NULLs, so the
+    // per-statement decoded bounds are both read and updated many times.
+    e2e_two_partitions("os", "n bigint, s text, r int4range");
+    Spi::run(
+        "INSERT INTO os VALUES (1, 0, 'm', '[0,1)'), (2, 0, 'm', '[0,1)');
+         CREATE INDEX os_tr ON os USING table_range (n, s, r);
+         INSERT INTO os
+         SELECT 1,
+                CASE WHEN g % 7 = 0 THEN NULL ELSE (g * 37 % 1001) - 500 END,
+                CASE WHEN g % 5 = 0 THEN NULL ELSE chr(97 + g % 26) || g END,
+                int4range(g % 300 - 150, g % 300 - 140)
+         FROM generate_series(1, 2000) g;",
+    )
+    .unwrap();
+    let expected = Spi::get_one::<String>(
+        "SELECT format('min=Some(\"%s\") max=Some(\"%s\") has_nulls=true',
+                       min(n), max(n))
+                || ' | ' ||
+                format('min=Some(\"%s\") max=Some(\"%s\") has_nulls=true',
+                       min(s COLLATE \"default\"), max(s COLLATE \"default\"))
+                || ' | ' ||
+                format('min=Some(\"%s\")', range_merge(range_agg(r)))
+         FROM os_1",
+    )
+    .unwrap()
+    .unwrap();
+    let summary = am_leaf_summary("os_1");
+    for want in expected.split(" | ") {
+        assert!(summary.contains(want), "summary {summary}\nmissing {want}");
+    }
+    for pred in ["n = -500", "n = 500", "s = 'z25'", "r && '[149,150)'::int4range"] {
+        e2e_same_on_off("os", pred);
+    }
 }
