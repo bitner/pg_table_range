@@ -1,5 +1,7 @@
 use crate::index_storage::{self, ColSummary};
 use crate::prune_hook::{btree_cmp_proc, datum_cmp, datum_to_text, text_to_datum};
+use crate::stable_io::with_stable_io;
+use crate::summary_build::{geometry_schema, spi_value};
 use pgrx::pg_sys;
 use pgrx::prelude::*;
 
@@ -37,6 +39,8 @@ pub unsafe extern "C-unwind" fn table_range_amhandler(
         amroutine.amcanmulticol = true; // CREATE INDEX may list several columns
         amroutine.amoptionalkey = true; // queries need not constrain the first column
         amroutine.amstorage = true; // opclasses declare a STORAGE type
+                                    // Summarizing (like BRIN): updates of indexed columns can stay HOT.
+        amroutine.amsummarizing = true;
 
         amroutine.ambuild = Some(am_build);
         amroutine.ambuildempty = Some(am_buildempty);
@@ -51,41 +55,29 @@ pub unsafe extern "C-unwind" fn table_range_amhandler(
     }
 }
 
-/// Build the summary for one (leaf) relation from its actual data.
+/// Errors propagate: a failed build must fail `CREATE INDEX`, not silently disable pruning.
 #[pg_guard]
 unsafe extern "C-unwind" fn am_build(
     heap: pg_sys::Relation,
     index: pg_sys::Relation,
     index_info: *mut pg_sys::IndexInfo,
 ) -> *mut pg_sys::IndexBuildResult {
-    let heap_relid = (*heap).rd_id;
-
-    let nattrs = (*index_info).ii_NumIndexAttrs.max(0) as usize;
-    let attnums: Vec<i16> = (0..nattrs)
-        .map(|i| (*index_info).ii_IndexAttrNumbers[i])
-        .collect();
-
-    // Compute the summary via SPI under a freshly pushed snapshot so the snapshot the
-    // CREATE INDEX portal relies on is restored afterwards. Any failure degrades to
-    // "no summary" (KEEP at planning time).
-    pg_sys::PushActiveSnapshot(pg_sys::GetTransactionSnapshot());
-    let summary = pgrx::PgTryBuilder::new(|| {
-        let names = crate::summary_build::column_names_for_attnums(heap_relid, &attnums).ok()?;
-        crate::summary_build::build_one_leaf(heap_relid, &names).ok()
-    })
-    .catch_others(|_| None)
-    .execute();
-    pg_sys::PopActiveSnapshot();
-
-    // Persist the summary into the index's own metapage. Page writes use no snapshot,
-    // so this happens after the SPI section.
-    if let Some(summary) = summary {
-        let _ = crate::index_storage::write_summary(index, &summary);
+    // A partial index never sees inserts outside its predicate, so could not cover them.
+    if !(*index_info).ii_Predicate.is_null() {
+        ereport!(
+            ERROR,
+            PgSqlErrorCode::ERRCODE_FEATURE_NOT_SUPPORTED,
+            "table_range indexes cannot be partial"
+        );
     }
+
+    let mut built = crate::summary_build::build_leaf_summary(heap, index, index_info);
+    index_storage::write_summary(index, &mut built.summary).unwrap_or_else(|e| error!("{e}"));
 
     let result = pg_sys::palloc0(std::mem::size_of::<pg_sys::IndexBuildResult>())
         as *mut pg_sys::IndexBuildResult;
-    (*result).heap_tuples = 0.0;
+    // index_build stores this as the heap's reltuples.
+    (*result).heap_tuples = built.heap_tuples;
     (*result).index_tuples = 0.0;
     result
 }
@@ -97,6 +89,8 @@ unsafe extern "C-unwind" fn am_buildempty(_index: pg_sys::Relation) {}
 /// the BRIN-style maintenance path. Because the summary only needs to be over-inclusive,
 /// this update is in place and needs no MVCC; an insert that stays within the existing
 /// range writes nothing. This keeps pruning correct and active without any REINDEX.
+///
+/// Errors are not caught: an insert the summary does not cover must not succeed.
 #[pg_guard]
 #[allow(clippy::too_many_arguments)] // signature is fixed by PostgreSQL's aminsert_function
 unsafe extern "C-unwind" fn am_insert(
@@ -104,29 +98,57 @@ unsafe extern "C-unwind" fn am_insert(
     values: *mut pg_sys::Datum,
     isnull: *mut bool,
     _heap_tid: pg_sys::ItemPointer,
-    _heap: pg_sys::Relation,
+    heap: pg_sys::Relation,
     _check_unique: pg_sys::IndexUniqueCheck::Type,
     _index_unchanged: bool,
     index_info: *mut pg_sys::IndexInfo,
 ) -> bool {
-    pgrx::PgTryBuilder::new(|| widen_on_insert(index, index_info, values, isnull))
-        .catch_others(|_| ())
-        .execute();
+    widen_on_insert(index, heap, index_info, values, isnull);
     false
 }
 
-/// Read the metapage summary, widen each indexed column to cover the new value, and
-/// write it back only if something changed.
+/// Compare-and-swap against the bytes read, so concurrent widenings never overwrite each other.
 unsafe fn widen_on_insert(
     index: pg_sys::Relation,
+    heap: pg_sys::Relation,
     index_info: *mut pg_sys::IndexInfo,
     values: *mut pg_sys::Datum,
     isnull: *mut bool,
 ) {
-    let mut summary = match index_storage::read_summary(index) {
-        Some(s) => s,
-        None => return,
-    };
+    loop {
+        pgrx::check_for_interrupts!();
+        // No summary, or an unreadable one: the planner never prunes with it.
+        let Some(before) = index_storage::read_blob(index) else {
+            return;
+        };
+        let Some(mut summary) = index_storage::deserialize(&before) else {
+            return;
+        };
+        let changed =
+            with_stable_io(|| widen_summary(&mut summary, index, index_info, values, isnull))
+                .unwrap_or_else(|| {
+                    error!("table_range: cannot maintain a summary in parallel mode")
+                });
+        if !changed {
+            return;
+        }
+        let after = index_storage::encode_fitting(&mut summary);
+        if index_storage::replace_blob_if(index, &before, &after).unwrap_or_else(|e| error!("{e}"))
+        {
+            crate::summary_cache::note_widened((*index).rd_id, (*heap).rd_id);
+            return;
+        }
+        // Changed by another backend since we read it: retry.
+    }
+}
+
+unsafe fn widen_summary(
+    summary: &mut index_storage::IndexSummary,
+    index: pg_sys::Relation,
+    index_info: *mut pg_sys::IndexInfo,
+    values: *mut pg_sys::Datum,
+    isnull: *mut bool,
+) -> bool {
     let nattrs = (*index_info).ii_NumIndexAttrs.max(0) as usize;
     let mut changed = false;
     for i in 0..nattrs {
@@ -143,29 +165,24 @@ unsafe fn widen_on_insert(
         };
         changed |= widen_column(col, typoid, collation, *values.add(i), *isnull.add(i));
     }
-    if changed {
-        let _ = index_storage::write_summary(index, &summary);
-        // The on-page summary just widened; drop any cached (now-too-narrow) copy in every
-        // backend so planning never prunes away the newly covered values.
-        crate::summary_cache::note_widened((*index).rd_id);
-    }
+    changed
 }
-
 /// The type OID of a tuple descriptor's `i`-th attribute, portable across PG versions.
 /// PG18 made `TupleDescAttr` an inline function (bound by pgrx) and moved attributes to
 /// `compact_attrs` (which has no `atttypid`); PG13–17 expose `attrs` directly and only a
 /// `TupleDescAttr` macro (which bindgen does not surface as `pg_sys::TupleDescAttr`).
 #[cfg(feature = "pg18")]
-unsafe fn att_typid(tupdesc: pg_sys::TupleDesc, i: usize) -> pg_sys::Oid {
+pub(crate) unsafe fn att_typid(tupdesc: pg_sys::TupleDesc, i: usize) -> pg_sys::Oid {
     (*pg_sys::TupleDescAttr(tupdesc, i as i32)).atttypid
 }
 #[cfg(not(feature = "pg18"))]
-unsafe fn att_typid(tupdesc: pg_sys::TupleDesc, i: usize) -> pg_sys::Oid {
+pub(crate) unsafe fn att_typid(tupdesc: pg_sys::TupleDesc, i: usize) -> pg_sys::Oid {
     let natts = (*tupdesc).natts as usize;
     (*tupdesc).attrs.as_slice(natts)[i].atttypid
 }
 
-/// Widen one column's summary for a single inserted value. Returns whether it changed.
+/// Returns whether the summary changed. A value that cannot be folded in makes the column
+/// unbounded rather than leaving it too narrow.
 unsafe fn widen_column(
     col: &mut ColSummary,
     typoid: pg_sys::Oid,
@@ -186,79 +203,116 @@ unsafe fn widen_column(
         col.all_nulls = false;
         changed = true;
     }
-
-    if col.overlap {
-        return changed | widen_overlap(col, typoid, value);
+    if col.unbounded {
+        return changed;
     }
 
-    // btree min/max: widen using the column type's compare support function.
-    let new_text = match datum_to_text(typoid, value) {
-        Some(t) => t,
-        None => return changed,
+    let widened = if col.overlap {
+        widen_overlap(col, typoid, value)
+    } else {
+        widen_minmax(col, typoid, collation, value)
     };
-    match (&col.min, &col.max) {
-        (Some(min), Some(max)) => {
-            let cmp = match btree_cmp_proc(typoid) {
-                Some(c) => c,
-                None => return changed,
-            };
-            if let (Some(min_d), Some(max_d)) =
-                (text_to_datum(typoid, min), text_to_datum(typoid, max))
-            {
-                if datum_cmp(cmp, collation, value, min_d) < 0 {
-                    col.min = Some(new_text.clone());
-                    changed = true;
-                }
-                if datum_cmp(cmp, collation, value, max_d) > 0 {
-                    col.max = Some(new_text);
-                    changed = true;
-                }
-            }
-        }
-        // No range yet (was all-null/empty): seed it with this value.
-        _ => {
-            col.min = Some(new_text.clone());
-            col.max = Some(new_text);
-            changed = true;
+    match widened {
+        Some(c) => changed | c,
+        None => {
+            col.make_unbounded();
+            true
         }
     }
-    changed
 }
 
-/// Widen an overlap (range/geometry) extent to cover a new value, via the type's own
-/// union operator (delegated to SQL). Writes nothing if the value is already covered.
-unsafe fn widen_overlap(col: &mut ColSummary, typoid: pg_sys::Oid, value: pg_sys::Datum) -> bool {
-    let new_text = match datum_to_text(typoid, value) {
-        Some(t) => t,
-        None => return false,
-    };
-    let tn = &col.type_name;
-    let is_geometry = tn == "geometry" || tn.ends_with(".geometry");
-    let lit = |s: &str| format!("'{}'", s.replace('\'', "''"));
-    let new_lit = lit(&new_text);
-
-    let sql = match &col.min {
-        None if is_geometry => format!(
-            "SELECT ST_Extent(g)::geometry::text FROM (VALUES (CAST({new_lit} AS {tn}))) v(g)"
-        ),
-        None => format!("SELECT CAST({new_lit} AS {tn})::text"),
-        Some(ext) if is_geometry => format!(
-            "SELECT ST_Extent(g)::geometry::text FROM \
-             (VALUES (CAST({} AS {tn})), (CAST({new_lit} AS {tn}))) v(g)",
-            lit(ext)
-        ),
-        Some(ext) => format!(
-            "SELECT range_merge(CAST({} AS {tn}), CAST({new_lit} AS {tn}))::text",
-            lit(ext)
-        ),
-    };
-
-    let widened = Spi::get_one::<String>(&sql).ok().flatten();
-    if widened.is_some() && widened != col.min {
-        col.min = widened;
-        return true;
+/// `None`: the value could not be compared against the stored bounds.
+unsafe fn widen_minmax(
+    col: &mut ColSummary,
+    typoid: pg_sys::Oid,
+    collation: pg_sys::Oid,
+    value: pg_sys::Datum,
+) -> Option<bool> {
+    // Domains compare and parse as their base type.
+    let base = pg_sys::getBaseType(typoid);
+    let new_text = datum_to_text(typoid, value)?;
+    match (&col.min, &col.max) {
+        (Some(min), Some(max)) => {
+            let cmp = btree_cmp_proc(base)?;
+            let min_d = text_to_datum(base, min)?;
+            let max_d = text_to_datum(base, max)?;
+            let mut changed = false;
+            if datum_cmp(cmp, collation, value, min_d) < 0 {
+                col.min = Some(new_text.clone());
+                changed = true;
+            }
+            if datum_cmp(cmp, collation, value, max_d) > 0 {
+                col.max = Some(new_text);
+                changed = true;
+            }
+            Some(changed)
+        }
+        // No range yet (was all-null/empty): seed it with this value.
+        (None, None) => {
+            col.min = Some(new_text.clone());
+            col.max = Some(new_text);
+            Some(true)
+        }
+        _ => None,
     }
-    false
+}
+
+/// `None`: the new extent could not be computed.
+unsafe fn widen_overlap(
+    col: &mut ColSummary,
+    typoid: pg_sys::Oid,
+    value: pg_sys::Datum,
+) -> Option<bool> {
+    let base = pg_sys::getBaseType(typoid);
+    let is_geometry = col.type_name.ends_with(".geometry");
+    let widened = if is_geometry {
+        geometry_extent_with(col, typoid, value)?
+    } else {
+        let merged = match &col.min {
+            None => value,
+            Some(ext) => {
+                let ext = text_to_datum(base, ext)?;
+                pg_sys::OidFunctionCall2Coll(
+                    pg_sys::Oid::from(pg_sys::F_RANGE_MERGE_ANYRANGE_ANYRANGE),
+                    pg_sys::Oid::INVALID,
+                    ext,
+                    value,
+                )
+            }
+        };
+        Some(datum_to_text(typoid, merged)?)
+    };
+
+    match widened {
+        Some(w) if col.min.as_ref() != Some(&w) => {
+            col.min = Some(w);
+            Some(true)
+        }
+        Some(_) => Some(false),
+        // An empty geometry has no extent and can never satisfy `&&`: nothing to cover.
+        None => Some(false),
+    }
+}
+
+/// `Some(None)` if neither the stored extent nor `value` has one (empty geometries).
+unsafe fn geometry_extent_with(
+    col: &ColSummary,
+    typoid: pg_sys::Oid,
+    value: pg_sys::Datum,
+) -> Option<Option<String>> {
+    let new_text = datum_to_text(typoid, value)?;
+    let tn = &col.type_name;
+    let ns = geometry_schema(tn);
+    let lit = |s: &str| format!("'{}'", s.replace('\'', "''"));
+    let mut rows = format!("(CAST({} AS {tn}))", lit(&new_text));
+    if let Some(ext) = &col.min {
+        rows.push_str(&format!(", (CAST({} AS {tn}))", lit(ext)));
+    }
+    let sql = format!("SELECT {ns}.st_extent(g)::{tn}::pg_catalog.text FROM (VALUES {rows}) v(g)");
+    pg_sys::SPI_connect();
+    let extent = spi_value(&sql);
+    pg_sys::SPI_finish();
+    Some(extent)
 }
 
 #[pg_guard]

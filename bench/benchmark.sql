@@ -1,6 +1,6 @@
 -- Reproducible benchmarks for pg_table_range.
 --
---   cargo pgrx run pg18
+--   cargo pgrx run pg18 --release
 --   \i bench/benchmark.sql
 --
 -- Reports planning and execution time separately (warm) via EXPLAIN (ANALYZE), for:
@@ -8,19 +8,12 @@
 --   2. Honest comparison to native partition pruning: two identical columns, one the
 --      partition key (pruned natively) and one not (pruned by table_range).
 --
--- Note: cargo pgrx run reuses its database. If you have previously loaded older versions
--- of this extension, stale event triggers can interfere; this script drops the extension
--- and recreates it for a clean baseline.
+-- The script drops and recreates the extension for a clean baseline.
 
 \set ECHO none
 \pset pager off
 
 DROP EXTENSION IF EXISTS pg_table_range CASCADE;
--- Clear any event triggers left behind by older builds (no-ops on a clean DB).
-DROP EVENT TRIGGER IF EXISTS table_range_hide_indexes_trg;
-DROP EVENT TRIGGER IF EXISTS table_range_drop_trg;
-DROP EVENT TRIGGER IF EXISTS table_range_opclass_sync_trg;
-DROP FUNCTION IF EXISTS table_range_hide_indexes() CASCADE;
 CREATE EXTENSION pg_table_range;
 
 -- ====================================================================================

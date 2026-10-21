@@ -73,6 +73,8 @@ cargo pgrx init --pg18 /usr/lib/postgresql/18/bin/pg_config
 cargo pgrx install --release
 ```
 
+When upgrading, follow the steps for each version in [CHANGELOG.md](CHANGELOG.md).
+
 The distribution is also on [PGXN](https://pgxn.org/dist/pg_table_range/): `pgxn download
 pg_table_range`, unzip, then `make install` (or the cargo-pgrx commands above). `pgxn
 install` runs the bundled `Makefile`, so it works too — but still needs cargo-pgrx present,
@@ -93,8 +95,8 @@ CREATE INDEX events_tr ON events USING table_range (val, created_at);
 -- Verify with EXPLAIN: non-matching partitions disappear from the plan.
 EXPLAIN (COSTS OFF) SELECT * FROM events WHERE val >= 250;
 
--- Inserts maintain the summary automatically; REINDEX only re-tightens after many
--- deletes. DROP INDEX removes the summary with the index.
+-- Inserts maintain the summary automatically; REINDEX re-tightens it after deletes.
+-- DROP INDEX removes the summary with the index.
 REINDEX INDEX events_tr;
 DROP INDEX events_tr;
 ```
@@ -122,31 +124,42 @@ EXPLAIN (COSTS OFF) SELECT * FROM places WHERE geom && ST_MakeEnvelope(0,0,10,10
   that partition's index — one record per indexed column on the index's **metapage**, not
   in any side table. It holds the `has_nulls` / `all_nulls` flags plus either the column's
   btree `min`/`max` (scalar columns) or a single covering **extent** — a covering range
-  for range types (`range_merge(range_agg(col))`) or the bounding box for PostGIS geometry
-  (`ST_Extent(col)`).
+  for range types (via `range_merge`) or the bounding box for PostGIS geometry (via
+  `ST_Extent`). `CREATE INDEX` / `REINDEX` compute it with the table AM's index-build
+  scan (as BRIN does), which also covers rows that older snapshots can still see.
 - **Planning.** For each partition the planner builds, a `set_rel_pathlist_hook` reads the
   summary from that partition's index and evaluates the partition's restriction clauses
   against it, calling `mark_dummy_rel` on any partition that provably cannot match —
-  eliminating it before child paths are generated. Deserialized summaries are cached for
+  eliminating it from the plan. Deserialized summaries are cached for
   the life of the backend (kept coherent by a relcache-invalidation callback), so warm
   plans skip the per-partition page read; see [Performance](#performance).
-- **Typed comparisons.** Min/max vs. constant comparisons use each column type's own
-  btree compare function, so **any btree-comparable type works**: `bigint` / `int` /
-  `smallint`, `numeric`, `real` / `double precision`, `text` / `varchar`, `date`,
-  `time`, `timestamp`, `timestamptz`, `uuid`, `boolean`, `oid`, etc. Any conversion
-  problem degrades safely to "keep".
+- **Typed comparisons.** Min/max are compared with the query's constant as given, using
+  the btree operator family's compare function for the operator's (column, constant)
+  type pair — so cross-type predicates such as `bigint_col = 5` or
+  `float8_col > 1.5::float4` compare exactly. **Any btree-comparable type works**:
+  `bigint` / `int` / `smallint`, `numeric`, `real` / `double precision`, `text` /
+  `varchar`, `date`, `time`, `timestamp`, `timestamptz`, `uuid`, `boolean`, enums, `oid`,
+  etc. Text-like columns prune only when the query compares under the collation the
+  summary was built with (the index column's collation). Any conversion problem degrades
+  safely to "keep".
 - **Overlap (`&&`).** For range types and PostGIS geometry, an `&&` (overlaps) predicate
-  is pruned by testing the constant against the partition's stored extent with
-  PostgreSQL's own `&&` operator — so a partition is eliminated when its extent cannot
-  overlap the query.
+  is pruned by calling the clause's own `&&` operator on the partition's stored extent
+  and the constant — so a partition is eliminated when its extent cannot overlap the
+  query. Only an `&&` implemented in `pg_catalog` or in the column type's own schema is
+  trusted.
 - **Incremental maintenance (no REINDEX).** `aminsert` widens the summary in place as
   rows are inserted — the same way BRIN maintains its ranges. Because the summary only
   ever needs to be over-inclusive, these updates need no MVCC: an insert within the
-  existing range writes nothing; one that extends it grows the min/max/extent. Pruning
-  therefore stays correct **and** active across inserts without any rebuild. Deletes only
-  shrink a partition's true range, leaving the summary conservatively wide (still safe);
-  `VACUUM`/`REINDEX` can re-tighten it for selectivity. `DROP INDEX` removes the summary
-  with the index's storage — there is no side table to clean up.
+  existing range writes nothing; one that extends it grows the min/max/extent, as a
+  compare-and-swap on the metapage so concurrent inserts never overwrite each other's
+  widening. A widening invalidates cached copies of the summary and cached plans on the
+  partition in every backend. If a value cannot be represented (for example it is too
+  large for the metapage), that column becomes *unbounded* — it no longer prunes by
+  value, but is never too narrow. Pruning therefore stays correct **and** active across
+  inserts without any rebuild. Deletes only shrink a partition's true range, leaving the
+  summary conservatively wide (still safe); `REINDEX` re-tightens it once the deleted rows
+  are no longer visible to any transaction (`VACUUM` does not). `DROP INDEX` removes the
+  summary with the index's storage — there is no side table to clean up.
 
 ## Performance
 
@@ -155,20 +168,21 @@ selective predicate on a non-key column scans only the matching partition instea
 partition. The planner pays a little to evaluate each partition's summary, but that cost is
 small and — warm — close to free (see the cache note below).
 
-The numbers below are reproducible with `bench/benchmark.sql` (`cargo pgrx run pg18`, then
-`\i bench/benchmark.sql`); they report `EXPLAIN (ANALYZE)` planning and execution time
-separately, warm, on PostgreSQL 18.
+The numbers below are reproducible with `bench/benchmark.sql` (`cargo pgrx run pg18
+--release`, then `\i bench/benchmark.sql`); they are medians of the warm `EXPLAIN
+(ANALYZE)` planning and execution times over three runs of the script, on PostgreSQL 18.4
+with a release build of the extension. Absolute numbers depend on hardware.
 
 **Faster execution.** 300 partitions × 8,000 rows (2.4M rows), `WHERE nk = <value in one
 partition>`:
 
 | | Planning | Execution | Total |
 |---|---|---|---|
-| pruning **off** (scans all 300 partitions) | ~4 ms | ~110 ms | ~114 ms |
-| pruning **on** (scans 1 partition) | ~4 ms | ~0.4 ms | **~4 ms** |
+| pruning **off** (scans all 300 partitions) | ~1.5 ms | ~55 ms | ~57 ms |
+| pruning **on** (scans 1 partition) | ~1.0 ms | ~0.2 ms | **~1.2 ms** |
 
-Execution is ~250× faster, total time drops ~25×, and warm the planning overhead is in the
-noise. The win grows with how much data the eliminated partitions hold; measure your
+Execution is ~275× faster, total time drops ~45×, and planning is no slower (pruned
+partitions drop out before the parent's paths are built). The win grows with how much data the eliminated partitions hold; measure your
 workload with `table_range.enable_pruning`.
 
 **Honest comparison to native pruning.** When a predicate is on the *partition key*,
@@ -179,15 +193,16 @@ natively) and `nk` (the same values, not the key, pruned by table_range):
 
 | Same `=` predicate, 2,000 partitions | Planning | Execution |
 |---|---|---|
-| native pruning — column **is** the partition key | **~0.15 ms** | ~0.05 ms |
-| table_range — column is **not** the partition key | ~34 ms | ~0.06 ms |
-| no pruning — scans all 2,000 partitions | ~28 ms | ~27 ms |
+| native pruning — column **is** the partition key | **~0.05 ms** | ~0.02 ms |
+| table_range — column is **not** the partition key | ~15 ms | ~0.02 ms |
+| no pruning — scans all 2,000 partitions | ~15 ms | ~17 ms |
 
 Native pruning is *hundreds of times* cheaper to plan and is effectively constant in the
 partition count. table_range cannot match that (see
 [Scaling](#scaling-and-partition-count)): its job is the case native pruning **can't** do
-— eliminating partitions by a non-key column. Note that table_range's overhead over the
-no-pruning baseline (~28 ms to expand 2,000 partitions) is now small (~6 ms, ~3 µs/part).
+— eliminating partitions by a non-key column. table_range's own cost is within measurement
+noise of the no-pruning baseline: nearly all of the ~15 ms is PostgreSQL expanding 2,000
+partitions.
 
 **Comparison to `CHECK` constraint exclusion.** The built-in way to prune on a non-key
 column is to put a data-range `CHECK (col BETWEEN lo AND hi)` on each partition and let the
@@ -196,12 +211,12 @@ baseline. Same table, 2,000 partitions, same `nk = <value>` predicate:
 
 | Same `=` predicate, 2,000 partitions | Planning | Execution | Scans |
 |---|---|---|---|
-| `CHECK` constraint exclusion (`constraint_exclusion=on`) | ~37 ms | ~0.08 ms | 1 partition |
-| table_range pruning | ~34 ms | ~0.08 ms | 1 partition |
-| no pruning | ~26 ms | ~25 ms | all 2,000 |
+| `CHECK` constraint exclusion (`constraint_exclusion=on`) | ~17.6 ms | ~0.04 ms | 1 partition |
+| table_range pruning | ~14.7 ms | ~0.04 ms | 1 partition |
+| no pruning | ~14.2 ms | ~15.6 ms | all 2,000 |
 
-Both are O(partitions) and give the **identical execution win**, and **table_range now
-plans on par with — and warm, slightly faster than — constraint exclusion.** (Constraint
+Both are O(partitions) and give the **identical execution win**, and **table_range plans
+faster than constraint exclusion.** (Constraint
 exclusion re-parses each partition's `CHECK` expression on every plan; table_range serves
 warm plans from a cached summary, see below.) On top of matching the speed, table_range
 avoids everything `CHECK` constraints make you give up:
@@ -213,18 +228,16 @@ avoids everything `CHECK` constraints make you give up:
 - **Incremental maintenance** — changing a `CHECK` means `DROP`/`ADD CONSTRAINT` with a
   full-partition revalidation scan; table_range widens in place in `aminsert`, no rescan.
 
-**How the per-partition cost got small.** Two optimizations took the per-partition planning
-cost from ~31 µs to ~3–4 µs:
+**Why the per-partition cost is small.**
 
-1. *Per-plan compilation.* The compare function, type-input function, and operator strategy
-   are identical across a column's partitions, so they are resolved once per plan
-   (cached `FmgrInfo`s) instead of re-looked-up for each partition.
+1. *Per-plan compilation.* An operator's strategy and compare function, and a type's input
+   function, are the same for every partition, so they are resolved once per plan (cached
+   `FmgrInfo`s).
 2. *Backend summary cache.* Each index's deserialized summary is cached for the life of the
-   backend, so warm/repeated plans skip the per-partition index open and metapage
-   read+deserialize entirely. The cache is kept coherent by a relcache invalidation
-   callback: `aminsert` only ever *widens* a summary, and when it does it invalidates the
-   cached copy everywhere — so a cached summary is never narrower than reality (a wider one
-   prunes correctly). A cold first plan still reads each page; every plan after is cached.
+   backend, so warm plans skip the per-partition index open and metapage read. `aminsert`
+   only ever *widens* a summary, and when it does it invalidates the cached copy (and
+   cached plans on that partition) everywhere — so a cached summary is never narrower than
+   reality. A cold first plan still reads each page.
 
 ## Scaling and partition count
 
@@ -269,9 +282,8 @@ Two practical consequences and how to handle them:
   concurrency. With default `max_connections`, a few thousand (e.g. `4096`) covers tens of
   thousands of partitions; each lock slot costs only a few hundred bytes of shared memory.
 - **Planning time grows with partition count.** Even below the lock wall, planning scales
-  linearly — though the per-partition constant is now small (~3–4 µs warm, on par with
-  `CHECK` constraint exclusion) thanks to the per-plan compilation and backend summary
-  cache described above. **Mitigations:** prefer **fewer, larger partitions** (table_range's
+  linearly, dominated by PostgreSQL's own partition expansion (~15 ms for 2,000 partitions
+  in the benchmark above); table_range's evaluation adds little on top. **Mitigations:** prefer **fewer, larger partitions** (table_range's
   sweet spot — the execution win is biggest there anyway); use **prepared statements** so a
   plan is reused across executions; and where you can, **align the hot filter column with
   the partition key** so native pruning handles it.
@@ -286,7 +298,9 @@ support in PostgreSQL core.
 Everything not listed is conservatively **kept** (never mispruned):
 
 - Comparisons `col < c`, `<=`, `=`, `>=`, `>` (either operand order), and `BETWEEN`
-  (the planner expands it into two comparisons).
+  (the planner expands it into two comparisons), including cross-type operators of the
+  column's btree operator family. Comparisons under a collation other than the index
+  column's (e.g. `col < 'x' COLLATE "C"` on an `en_US` column) are kept.
 - `col IS NULL` / `col IS NOT NULL`.
 - `col IN (c1, c2, …)` / `col = ANY(<const array>)` — pruned when no listed value falls
   in the partition's range.
@@ -306,6 +320,10 @@ Everything not listed is conservatively **kept** (never mispruned):
 
 There is no catalog table — each partition's summary lives on its `table_range` index's
 metapage (block 0), written by `ambuild` and updated in place by `aminsert`, like BRIN.
+Bounds are stored as each type's text form, written and read with the type I/O settings
+that affect it (`DateStyle`, `IntervalStyle`, `extra_float_digits`) pinned to
+round-trip-exact values. The on-page format is versioned: a summary in any other format
+version is never used for pruning until `REINDEX` rebuilds it.
 
 ## Project layout
 
@@ -316,14 +334,21 @@ metapage (block 0), written by `ambuild` and updated in place by `aminsert`, lik
 | `src/summary_build.rs` | build a leaf's summary by scanning its data (used by `ambuild`) |
 | `src/prune_hook.rs` | planner + pathlist hooks, per-plan compilation cache, typed in-memory evaluation |
 | `src/summary_cache.rs` | backend-lifetime per-index summary cache + relcache-invalidation coherence |
+| `src/stable_io.rs` | pins the GUCs that change a type's text form while summaries are written or read |
 | `src/index_am.rs` | `table_range` index AM: build, incremental `aminsert` widening, opclass provisioning |
 | `src/e2e_tests.rs`, `src/index_am_tests.rs` | end-to-end tests |
+| `tests/multisession.sh` | tests that need several concurrent backends (run against a live server) |
+| `sql/` | extension upgrade scripts |
 
 ## Building and testing
 
 ```sh
 cargo pgrx test pg18      # run the end-to-end test suite (PostgreSQL 18)
 cargo pgrx run  pg18      # open psql with the extension installed
+
+# multi-backend tests, against a running server with the extension installed
+cargo pgrx install && cargo pgrx start pg18
+PGHOST=localhost PGPORT=28818 tests/multisession.sh
 ```
 
 Supported targets: PostgreSQL 16, 17, 18. The test suite is entirely end-to-end —
@@ -379,9 +404,19 @@ the published tarball via `.gitattributes`.
   `table_range.enable_pruning`.
 - `NOT IN` / `<> ALL`, `NOT (...)`, expression predicates, and parameterized
   prepared-statement plans are kept rather than pruned.
+- Partial indexes (`CREATE INDEX … USING table_range … WHERE …`) are rejected, and
+  expression columns in a table_range index are not summarized.
 - Inserts keep summaries current incrementally, but deletes only relax them (the summary
-  can stay wider than the live data until a `VACUUM`/`REINDEX` re-tightens it) — always
-  correct, just potentially less selective.
+  can stay wider than the live data until a `REINDEX` re-tightens it) — always correct,
+  just potentially less selective.
+- Every insert that widens a summary writes a full metapage image to WAL and invalidates
+  cached plans on that partition. Append-only workloads whose values keep growing (e.g.
+  timestamps) widen on nearly every insert.
+- Pruning is decided when a query is planned. Under `READ COMMITTED`, an insert that
+  widens a summary and commits after a query is planned but before it starts executing
+  can be missed by that one execution (cached plans are replanned once the widening
+  commits). A query planned and run in one `REPEATABLE READ` / `SERIALIZABLE` snapshot is
+  not affected.
 - Pruning engages only while the index is **valid** (`indisvalid`); the planner ignores
   invalid indexes, so anything that invalidates a table_range index silently disables its
   pruning until rebuilt.
