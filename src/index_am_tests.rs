@@ -87,35 +87,34 @@ fn am_multicolumn_index_prunes() {
 fn am_insert_then_correct_without_rebuild() {
     am_setup();
     Spi::run("CREATE INDEX amt_tr ON amt USING table_range (val)").unwrap();
-    // Insert a value outside r1's built range; staleness must keep results correct.
+    // Insert a value outside r1's built range; aminsert widens the summary to cover it.
     Spi::run("INSERT INTO amt VALUES (1, 500, date '2025-01-01')").unwrap();
     assert_eq!(
         Spi::get_one::<i64>("SELECT count(*)::bigint FROM amt WHERE val = 500")
             .unwrap()
             .unwrap(),
         1,
-        "stale summary must not prune away the newly inserted row"
+        "widened summary must cover the newly inserted row"
     );
 }
 
 #[pg_test]
-fn am_bulk_insert_stays_correct_under_stale_memo() {
+fn am_bulk_insert_widens_summary() {
     am_setup();
     Spi::run("CREATE INDEX amt_tr ON amt USING table_range (val)").unwrap();
     Spi::run("SET table_range.enable_pruning = on").unwrap();
 
-    // Bulk insert many out-of-range rows into r1 in one statement. This exercises the
-    // per-transaction stale memo (r1 is marked stale once, not once per row); all rows
-    // must still be found despite the now-stale summary.
+    // Bulk insert many out-of-range rows into r1 in one statement. Each row widens the
+    // summary as needed, so all of them are found.
     Spi::run("INSERT INTO amt SELECT 1, g FROM generate_series(1000, 1099) g").unwrap();
     assert_eq!(
         Spi::get_one::<i64>("SELECT count(*)::bigint FROM amt WHERE val BETWEEN 1000 AND 1099")
             .unwrap()
             .unwrap(),
         100,
-        "stale summary must not prune away bulk-inserted rows"
+        "widened summary must cover bulk-inserted rows"
     );
-    // A predicate matching original r3 data still works (no over-pruning).
+    // A predicate matching r3's data still works (no over-pruning).
     assert_eq!(
         Spi::get_one::<i64>("SELECT count(*)::bigint FROM amt WHERE val = 250")
             .unwrap()
@@ -189,4 +188,108 @@ fn ambuild_writes_summary_to_page() {
         out.contains("min=Some(\"0\")") && out.contains("max=Some(\"99\")"),
         "ambuild must persist the summary to the index page: {out}"
     );
+}
+
+#[pg_test]
+fn am_reindex_rebuilds_summary() {
+    // REINDEX rebuilds the summary from the table's data.
+    Spi::run(
+        "DROP TABLE IF EXISTS rx CASCADE;
+         CREATE TABLE rx (val bigint);
+         INSERT INTO rx SELECT g FROM generate_series(1, 100) g;
+         CREATE INDEX rx_tr ON rx USING table_range (val);
+         INSERT INTO rx VALUES (500);
+         REINDEX INDEX rx_tr;",
+    )
+    .unwrap();
+    let summary =
+        Spi::get_one::<String>("SELECT table_range_test_read_summary('rx_tr'::regclass::oid)")
+            .unwrap()
+            .unwrap();
+    assert!(
+        summary.contains("min=Some(\"1\")") && summary.contains("max=Some(\"500\")"),
+        "REINDEX must rebuild the summary from the data: {summary}"
+    );
+    assert_eq!(e2e_same_on_off("rx", "val = 500"), 1);
+    assert_eq!(e2e_same_on_off("rx", "val = 300"), 0);
+}
+
+#[pg_test(error = "table_range indexes cannot be partial")]
+fn am_partial_index_rejected() {
+    Spi::run(
+        "DROP TABLE IF EXISTS pi CASCADE;
+         CREATE TABLE pi (val bigint, flag bool);
+         CREATE INDEX pi_tr ON pi USING table_range (val) WHERE flag;",
+    )
+    .unwrap();
+}
+
+#[pg_test]
+fn am_build_reports_heap_row_count() {
+    // index_build stores the reported heap_tuples as the table's reltuples.
+    Spi::run(
+        "DROP TABLE IF EXISTS rt CASCADE;
+         CREATE TABLE rt (val bigint);
+         INSERT INTO rt SELECT g FROM generate_series(1, 500) g;
+         ANALYZE rt;
+         CREATE INDEX rt_tr ON rt USING table_range (val);",
+    )
+    .unwrap();
+    let reltuples = Spi::get_one::<f32>("SELECT reltuples FROM pg_class WHERE relname = 'rt'")
+        .unwrap()
+        .unwrap();
+    assert_eq!(reltuples, 500.0);
+}
+
+#[pg_test]
+fn am_oversized_value_makes_column_unbounded() {
+    e2e_two_partitions("ov", "s text");
+    Spi::run(
+        "INSERT INTO ov VALUES (1, 'm'), (2, 'a');
+         CREATE INDEX ov_tr ON ov USING table_range (s);
+         INSERT INTO ov VALUES (1, 'z' || repeat('x', 9000));",
+    )
+    .unwrap();
+    assert_eq!(e2e_same_on_off("ov", "s > 'y'"), 1);
+    let summary = Spi::get_one::<String>(
+        "SELECT table_range_test_read_summary(i.indexrelid)
+         FROM pg_index i WHERE i.indrelid = 'ov_1'::regclass",
+    )
+    .unwrap()
+    .unwrap();
+    assert!(summary.contains("unbounded=true"), "{summary}");
+}
+
+#[pg_test]
+fn am_range_extent_widens_on_insert() {
+    e2e_two_partitions("rg", "r int4range");
+    Spi::run(
+        "INSERT INTO rg VALUES (1, '[0,10)'), (2, '[100,110)');
+         CREATE INDEX rg_tr ON rg USING table_range (r);
+         INSERT INTO rg VALUES (1, '[500,501)'), (1, 'empty');",
+    )
+    .unwrap();
+    assert_eq!(e2e_same_on_off("rg", "r && '[500,500]'::int4range"), 1);
+    // After the insert rg_1's extent is [0,501): past it, both partitions prune.
+    let plan = e2e_explain_on("rg", "r && '[600,601)'::int4range");
+    assert!(!plan.contains("rg_1") && !plan.contains("rg_2"), "{plan}");
+}
+
+#[pg_test]
+fn am_unknown_summary_format_is_ignored() {
+    // A well-formed summary in another format version claiming val in [0, 0].
+    Spi::run(
+        "DROP TABLE IF EXISTS fmt CASCADE;
+         CREATE TABLE fmt (val bigint);
+         INSERT INTO fmt VALUES (5);
+         CREATE INDEX fmt_tr ON fmt USING table_range (val);",
+    )
+    .unwrap();
+    // version 1 | ncols=1 | attnum=1 | overlap=0 | flags=0 | "int8" | min "0" | max "0"
+    Spi::run(
+        "SELECT table_range_test_write_blob('fmt_tr'::regclass::oid,
+           '\\x010100010000000400696e74380101003001010030')",
+    )
+    .unwrap();
+    assert_eq!(e2e_same_on_off("fmt", "val = 5"), 1);
 }

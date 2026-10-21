@@ -8,6 +8,7 @@ use pgrx::{GucContext, GucFlags, GucRegistry};
 mod index_am;
 mod index_storage;
 mod prune_hook;
+mod stable_io;
 mod summary_build;
 mod summary_cache;
 

@@ -1,5 +1,5 @@
+use pgrx::pg_guard;
 use pgrx::pg_sys;
-use pgrx::prelude::*;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
@@ -13,11 +13,9 @@ use crate::{TABLE_RANGE_ENABLE_PRUNING, TABLE_RANGE_LOG_PRUNING_DEBUG};
 //
 // For every base/partition-member relation the planner builds, we look up that
 // relation's cached summaries and evaluate its restriction clauses (`Var op Const`,
-// `Var IS [NOT] NULL`, `Var IN (...)`). Typed comparisons are performed in-memory with
-// the column type's btree compare support function, so any error (e.g. an
-// incompatible cast) is caught and degrades to KEEP. If any single clause proves the
-// partition cannot contain a matching row, we call `mark_dummy_rel` so the planner
-// eliminates it before generating child paths.
+// `Var IS [NOT] NULL`, `Var IN (...)`, `Var && Const`) in memory against the query's own
+// constant Datums. Anything that cannot be decided exactly degrades to KEEP. If any single
+// clause proves the partition cannot contain a matching row, we call `mark_dummy_rel`.
 //
 // Each partition's summary is read from its table_range index's metapage and cached for
 // the duration of one top-level planner invocation.
@@ -44,14 +42,8 @@ thread_local! {
     static AM_OID: Cell<Option<pg_sys::Oid>> = const { Cell::new(None) };
     /// Nesting depth of planner invocations (SPI during planning re-enters).
     static PLAN_DEPTH: Cell<u32> = const { Cell::new(0) };
-    /// Guards against re-entering pruning logic from the SPI overlap evaluation issues.
+    /// Guards against re-entering pruning logic from catalog access during evaluation.
     static IN_HOOK: Cell<bool> = const { Cell::new(false) };
-    /// Per-plan memo of each column type's btree compare proc OID (the lookup is three
-    /// syscache hits, identical for every partition of a column, so we do it once).
-    static CMP_PROC_MEMO: RefCell<HashMap<u32, Option<pg_sys::Oid>>> = RefCell::new(HashMap::new());
-    /// Per-plan memo of parsed query constants, keyed by (type oid, text). The same
-    /// constant is otherwise re-rendered and re-parsed once per partition.
-    static CONST_MEMO: RefCell<HashMap<(u32, String), pg_sys::Datum>> = RefCell::new(HashMap::new());
     /// Per-plan cache of resolved `FmgrInfo` structs (one palloc per function), so each
     /// comparison / input-function call across partitions skips the `fmgr_info` syscache
     /// lookup. Pointers are into the planner memory context and cleared per top-level plan.
@@ -59,8 +51,8 @@ thread_local! {
     /// Per-plan memo of a type's input function + ioparam (from `getTypeInputInfo`).
     static INPUT_INFO_MEMO: RefCell<HashMap<u32, (pg_sys::Oid, pg_sys::Oid)>> =
         RefCell::new(HashMap::new());
-    /// Per-plan memo of the btree strategy for an (operator, left type) pair.
-    static STRATEGY_MEMO: RefCell<HashMap<(u32, u32), Option<i16>>> = RefCell::new(HashMap::new());
+    /// Per-plan memo keyed by (operator, column is right operand): same for every partition.
+    static OP_MEMO: RefCell<HashMap<(u32, bool), Option<CompareOp>>> = RefCell::new(HashMap::new());
 }
 
 /// A planner-cached `FmgrInfo` for `proc_oid`, valid for the current plan. Avoids the
@@ -117,45 +109,65 @@ unsafe fn parse_cached(typ: pg_sys::Oid, text: &str) -> Option<pg_sys::Datum> {
     ))
 }
 
-/// btree strategy for an (operator, left type) pair, memoized for the current plan.
-unsafe fn strategy_cached(opno: pg_sys::Oid, lefttype: pg_sys::Oid) -> Option<i16> {
-    let key = (opno.into(), lefttype.into());
-    if let Some(v) = STRATEGY_MEMO.with(|m| m.borrow().get(&key).copied()) {
+#[derive(Clone, Copy)]
+struct CompareOp {
+    /// Strategy (1..=5) with the column on the left.
+    strategy: i16,
+    /// May be polymorphic (e.g. anyenum).
+    var_type: pg_sys::Oid,
+    /// Compare proc for (column-side type, constant-side type).
+    cmpproc: pg_sys::Oid,
+}
+
+unsafe fn compare_op_cached(opno: pg_sys::Oid, commuted: bool) -> Option<CompareOp> {
+    let key = (opno.into(), commuted);
+    if let Some(v) = OP_MEMO.with(|m| m.borrow().get(&key).copied()) {
         return v;
     }
-    let v = btree_strategy(opno, lefttype);
-    STRATEGY_MEMO.with(|m| {
+    let v = compare_op(opno, commuted);
+    OP_MEMO.with(|m| {
         m.borrow_mut().insert(key, v);
     });
     v
 }
 
-/// Compare proc for `typ`, memoized for the current plan. See [`btree_cmp_proc`].
-unsafe fn cmp_proc_cached(typ: pg_sys::Oid) -> Option<pg_sys::Oid> {
-    let key: u32 = typ.into();
-    if let Some(v) = CMP_PROC_MEMO.with(|m| m.borrow().get(&key).copied()) {
-        return v;
+unsafe fn compare_op(opno: pg_sys::Oid, commuted: bool) -> Option<CompareOp> {
+    let mut left = pg_sys::Oid::INVALID;
+    let mut right = pg_sys::Oid::INVALID;
+    pg_sys::op_input_types(opno, &mut left, &mut right);
+    let (var_type, const_type) = if commuted {
+        (right, left)
+    } else {
+        (left, right)
+    };
+    let opfamily = default_btree_family(var_type)?;
+    let strategy = match pg_sys::get_op_opfamily_strategy(opno, opfamily) {
+        s @ 1..=5 => s as i16,
+        _ => return None,
+    };
+    // Cross-type operators (float8 > float4) compare via the family's cross-type proc.
+    let cmpproc = pg_sys::get_opfamily_proc(opfamily, var_type, const_type, BTORDER_PROC as i16);
+    if cmpproc == pg_sys::Oid::INVALID {
+        return None;
     }
-    let v = btree_cmp_proc(typ);
-    CMP_PROC_MEMO.with(|m| {
-        m.borrow_mut().insert(key, v);
-    });
-    v
+    Some(CompareOp {
+        strategy: if commuted {
+            commute_strategy(strategy)
+        } else {
+            strategy
+        },
+        var_type,
+        cmpproc,
+    })
 }
 
-/// Parse `text` to a Datum of `typ`, memoized for the current plan. The cached Datum is
-/// allocated in the planner's memory context (which outlives the plan) and the memo is
-/// cleared per top-level plan, so the pointer stays valid for its lifetime.
-unsafe fn const_datum_cached(typ: pg_sys::Oid, text: &str) -> Option<pg_sys::Datum> {
-    let key = (typ.into(), text.to_string());
-    if let Some(d) = CONST_MEMO.with(|m| m.borrow().get(&key).copied()) {
-        return Some(d);
+/// A polymorphic operator input type (anyenum, anyarray) cannot parse text; use the column's.
+unsafe fn summary_parse_type(op_var_type: pg_sys::Oid, vartype: pg_sys::Oid) -> pg_sys::Oid {
+    if pg_sys::get_typtype(op_var_type) as u8 == b'p' {
+        pg_sys::getBaseType(vartype)
+    } else {
+        op_var_type
     }
-    let d = parse_cached(typ, text)?;
-    CONST_MEMO.with(|m| {
-        m.borrow_mut().insert(key, d);
-    });
-    Some(d)
 }
 
 /// Install our planner and pathlist hooks, preserving any previously-registered hooks.
@@ -168,6 +180,8 @@ pub fn install() {
     }
 }
 
+// `#[pg_guard]`: planner ERRORs reach Rust as panics, which must not unwind into C.
+#[pg_guard]
 unsafe extern "C-unwind" fn table_range_planner_hook(
     parse: *mut pg_sys::Query,
     query_string: *const std::ffi::c_char,
@@ -184,22 +198,25 @@ unsafe extern "C-unwind" fn table_range_planner_hook(
         clear_cache();
     }
 
-    let result = match PREV_PLANNER_HOOK {
+    // Per-plan state points into planner memory: reset it even when planning errors.
+    pgrx::PgTryBuilder::new(|| match PREV_PLANNER_HOOK {
         Some(prev) => prev(parse, query_string, cursor_options, bound_params),
         None => pg_sys::standard_planner(parse, query_string, cursor_options, bound_params),
-    };
-
-    let last = PLAN_DEPTH.with(|d| {
-        let v = d.get() - 1;
-        d.set(v);
-        v == 0
-    });
-    if last {
-        clear_cache();
-    }
-    result
+    })
+    .finally(|| {
+        let last = PLAN_DEPTH.with(|d| {
+            let v = d.get().saturating_sub(1);
+            d.set(v);
+            v == 0
+        });
+        if last {
+            clear_cache();
+        }
+    })
+    .execute()
 }
 
+#[pg_guard]
 unsafe extern "C-unwind" fn table_range_pathlist_hook(
     root: *mut pg_sys::PlannerInfo,
     rel: *mut pg_sys::RelOptInfo,
@@ -231,11 +248,16 @@ unsafe extern "C-unwind" fn table_range_pathlist_hook(
     }
 
     IN_HOOK.with(|f| f.set(true));
+    // shortcut: an ERROR here is caught without a subtransaction; switch input parsing to
+    // soft errors (InputFunctionCallSafe) and drop the catch once nothing else can raise.
     let prune = pgrx::PgTryBuilder::new(|| evaluate_relation(rel, relid))
         .catch_others(|_| false)
         .execute();
     IN_HOOK.with(|f| f.set(false));
 
+    // shortcut: decided at plan time, so under READ COMMITTED a widening that commits
+    // between planning and execution is missed by that execution; recheck at executor
+    // start if that window matters.
     if prune {
         if TABLE_RANGE_LOG_PRUNING_DEBUG.get() {
             let oid: u32 = relid.into();
@@ -248,13 +270,11 @@ unsafe extern "C-unwind" fn table_range_pathlist_hook(
 fn clear_cache() {
     CACHE.with(|c| c.borrow_mut().clear());
     AM_OID.with(|c| c.set(None));
-    CMP_PROC_MEMO.with(|c| c.borrow_mut().clear());
-    CONST_MEMO.with(|c| c.borrow_mut().clear());
     // FmgrInfo structs are palloc'd in the planner context and freed when it resets; we
     // just drop the (now-dangling-after-reset) pointers at the start/end of each plan.
     FMGR_MEMO.with(|c| c.borrow_mut().clear());
     INPUT_INFO_MEMO.with(|c| c.borrow_mut().clear());
-    STRATEGY_MEMO.with(|c| c.borrow_mut().clear());
+    OP_MEMO.with(|c| c.borrow_mut().clear());
 }
 
 /// The table_range access-method OID, resolved once per planner invocation.
@@ -325,6 +345,10 @@ unsafe fn read_index_summary(rel: *mut pg_sys::RelOptInfo) -> Rc<Vec<ColSummary>
 
 /// Returns true iff some restriction clause proves the partition cannot match.
 unsafe fn evaluate_relation(rel: *mut pg_sys::RelOptInfo, relid: pg_sys::Oid) -> bool {
+    crate::stable_io::with_stable_io(|| evaluate_relation_inner(rel, relid)).unwrap_or(false)
+}
+
+unsafe fn evaluate_relation_inner(rel: *mut pg_sys::RelOptInfo, relid: pg_sys::Oid) -> bool {
     let relid_u32: u32 = relid.into();
     load_summary(rel, relid_u32);
 
@@ -395,29 +419,35 @@ unsafe fn clause_proves_prune(node: *mut pg_sys::Node, rows: &[ColSummary], dept
 // ---------------------------------------------------------------------------------
 
 enum QualSpec {
-    /// `Var op Const`: prune decision from the column-typed btree comparison.
+    /// `Var op Const` with a btree operator.
     Compare {
         attnum: i16,
         strategy: i16,
-        typ: pg_sys::Oid,
+        parse_type: pg_sys::Oid,
+        cmpproc: pg_sys::Oid,
         collation: pg_sys::Oid,
-        const_text: String,
+        konst: pg_sys::Datum,
     },
     /// `Var IS [NOT] NULL`: decided from the summary's null flags.
     Null { attnum: i16, is_null: bool },
     /// `Var IN (const array)` / `= ANY`: prune iff no listed value falls in [min, max].
     InList {
         attnum: i16,
-        typ: pg_sys::Oid,
+        parse_type: pg_sys::Oid,
+        cmpproc: pg_sys::Oid,
         collation: pg_sys::Oid,
-        elems: Vec<Option<String>>,
+        elems: Vec<pg_sys::Datum>,
     },
     /// `Var && Const` (overlap): prune iff the partition's extent does not overlap the
-    /// constant. Used for range types and PostGIS geometry.
+    /// constant, evaluated with the clause's own operator. Used for range types and
+    /// PostGIS geometry.
     Overlap {
         attnum: i16,
-        const_text: String,
-        const_type_name: String,
+        parse_type: pg_sys::Oid,
+        opfunc: pg_sys::Oid,
+        collation: pg_sys::Oid,
+        konst: pg_sys::Datum,
+        commuted: bool,
     },
 }
 
@@ -442,26 +472,42 @@ impl QualSpec {
                     row.all_nulls
                 }
             }
-            // Scalar comparisons only apply to btree min/max summaries.
+            // min/max order says nothing about another collation's order.
             QualSpec::Compare {
                 strategy,
-                typ,
+                parse_type,
+                cmpproc,
                 collation,
-                const_text,
+                konst,
                 ..
-            } => !row.overlap && eval_compare(row, *strategy, *typ, *collation, const_text),
+            } => {
+                !row.overlap
+                    && row.collation == *collation
+                    && eval_compare(row, *strategy, *parse_type, *cmpproc, *collation, *konst)
+            }
             QualSpec::InList {
-                typ,
+                parse_type,
+                cmpproc,
                 collation,
                 elems,
                 ..
-            } => !row.overlap && eval_in_list(row, *typ, *collation, elems),
+            } => {
+                !row.overlap
+                    && row.collation == *collation
+                    && eval_in_list(row, *parse_type, *cmpproc, *collation, elems)
+            }
             // Overlap only applies to extent summaries.
             QualSpec::Overlap {
-                const_text,
-                const_type_name,
+                parse_type,
+                opfunc,
+                collation,
+                konst,
+                commuted,
                 ..
-            } => row.overlap && eval_overlap(row, const_text, const_type_name),
+            } => {
+                row.overlap
+                    && eval_overlap(row, *parse_type, *opfunc, *collation, *konst, *commuted)
+            }
         }
     }
 }
@@ -498,39 +544,41 @@ unsafe fn extract_opexpr(opexpr: *mut pg_sys::OpExpr) -> Option<QualSpec> {
     if attnum <= 0 || (*con).constisnull {
         return None;
     }
+    let opno = (*opexpr).opno;
 
     // Scalar btree comparison (`<`, `<=`, `=`, `>=`, `>`).
-    if let Some(strategy) = strategy_cached((*opexpr).opno, (*var).vartype) {
-        let strategy = if commuted {
-            commute_strategy(strategy)
-        } else {
-            strategy
-        };
-        if (1..=5).contains(&strategy) {
-            let const_text = datum_to_text((*con).consttype, (*con).constvalue)?;
-            return Some(QualSpec::Compare {
-                attnum,
-                strategy,
-                typ: (*var).vartype,
-                collation: (*opexpr).inputcollid,
-                const_text,
-            });
-        }
-        return None;
+    if let Some(op) = compare_op_cached(opno, commuted) {
+        return Some(QualSpec::Compare {
+            attnum,
+            strategy: op.strategy,
+            parse_type: summary_parse_type(op.var_type, (*var).vartype),
+            cmpproc: op.cmpproc,
+            collation: (*opexpr).inputcollid,
+            konst: (*con).constvalue,
+        });
     }
 
-    // Overlap operator (`&&`) for range types / PostGIS geometry. `&&` is commutative,
-    // so operand order does not matter.
-    if operator_name((*opexpr).opno).as_deref() == Some("&&") {
-        let const_text = datum_to_text((*con).consttype, (*con).constvalue)?;
-        let const_type_name = type_name((*con).consttype)?;
+    if is_trusted_overlap_op(opno, (*var).vartype) {
         return Some(QualSpec::Overlap {
             attnum,
-            const_text,
-            const_type_name,
+            parse_type: pg_sys::getBaseType((*var).vartype),
+            opfunc: pg_sys::get_opcode(opno),
+            collation: (*opexpr).inputcollid,
+            konst: (*con).constvalue,
+            commuted,
         });
     }
     None
+}
+
+/// Only an `&&` from pg_catalog or the column type's schema is trusted to mean "overlaps".
+unsafe fn is_trusted_overlap_op(opno: pg_sys::Oid, vartype: pg_sys::Oid) -> bool {
+    if operator_name(opno).as_deref() != Some("&&") {
+        return false;
+    }
+    let ns = pg_sys::get_func_namespace(pg_sys::get_opcode(opno));
+    ns == pg_sys::Oid::from(pg_sys::PG_CATALOG_NAMESPACE)
+        || Some(ns) == type_namespace(pg_sys::getBaseType(vartype))
 }
 
 unsafe fn extract_nulltest(nulltest: *mut pg_sys::NullTest) -> Option<QualSpec> {
@@ -571,15 +619,16 @@ unsafe fn extract_saop(saop: *mut pg_sys::ScalarArrayOpExpr) -> Option<QualSpec>
         return None;
     }
     // Only the equality operator gives the "any element in range" semantics.
-    if strategy_cached((*saop).opno, (*var).vartype)? != 3 {
+    let op = compare_op_cached((*saop).opno, false)?;
+    if op.strategy != 3 {
         return None;
     }
-    let elems = array_const_texts(con)?;
     Some(QualSpec::InList {
         attnum,
-        typ: (*var).vartype,
+        parse_type: summary_parse_type(op.var_type, (*var).vartype),
+        cmpproc: op.cmpproc,
         collation: (*saop).inputcollid,
-        elems,
+        elems: array_const_datums(con)?,
     })
 }
 
@@ -587,112 +636,79 @@ unsafe fn extract_saop(saop: *mut pg_sys::ScalarArrayOpExpr) -> Option<QualSpec>
 // Typed in-memory evaluation
 // ---------------------------------------------------------------------------------
 
+unsafe fn parsed_bounds(
+    row: &ColSummary,
+    parse_type: pg_sys::Oid,
+) -> Option<(pg_sys::Datum, pg_sys::Datum)> {
+    match (&row.min, &row.max) {
+        (Some(min), Some(max)) if !row.unbounded => Some((
+            parse_cached(parse_type, min)?,
+            parse_cached(parse_type, max)?,
+        )),
+        _ => None, // no usable range -> conservative KEEP
+    }
+}
+
 unsafe fn eval_compare(
     row: &ColSummary,
     strategy: i16,
-    typ: pg_sys::Oid,
+    parse_type: pg_sys::Oid,
+    cmpproc: pg_sys::Oid,
     collation: pg_sys::Oid,
-    const_text: &str,
+    k: pg_sys::Datum,
 ) -> bool {
-    let (min, max) = match (&row.min, &row.max) {
-        (Some(min), Some(max)) => (min, max),
-        _ => return false, // no usable range -> conservative KEEP
+    let Some((min_d, max_d)) = parsed_bounds(row, parse_type) else {
+        return false;
     };
-    let cmpproc = match cmp_proc_cached(typ) {
-        Some(p) => p,
-        None => return false,
-    };
-    let k = match const_datum_cached(typ, const_text) {
-        Some(d) => d,
-        None => return false,
-    };
-    let min_d = match parse_cached(typ, min) {
-        Some(d) => d,
-        None => return false,
-    };
-    let max_d = match parse_cached(typ, max) {
-        Some(d) => d,
-        None => return false,
-    };
-    let cmp = |a, b| cmp_cached(cmpproc, collation, a, b);
+    let cmp = |bound| cmp_cached(cmpproc, collation, bound, k);
     match strategy {
-        1 => cmp(min_d, k) >= 0,                     // col < K  : prune iff min >= K
-        2 => cmp(min_d, k) > 0,                      // col <= K : prune iff min > K
-        3 => cmp(k, min_d) < 0 || cmp(k, max_d) > 0, // col = K : prune iff K outside [min,max]
-        4 => cmp(max_d, k) < 0,                      // col >= K : prune iff max < K
-        5 => cmp(max_d, k) <= 0,                     // col > K  : prune iff max <= K
+        1 => cmp(min_d) >= 0,                  // col < K  : prune iff min >= K
+        2 => cmp(min_d) > 0,                   // col <= K : prune iff min > K
+        3 => cmp(min_d) > 0 || cmp(max_d) < 0, // col = K  : prune iff K outside [min,max]
+        4 => cmp(max_d) < 0,                   // col >= K : prune iff max < K
+        5 => cmp(max_d) <= 0,                  // col > K  : prune iff max <= K
         _ => false,
     }
 }
 
 unsafe fn eval_in_list(
     row: &ColSummary,
-    typ: pg_sys::Oid,
+    parse_type: pg_sys::Oid,
+    cmpproc: pg_sys::Oid,
     collation: pg_sys::Oid,
-    elems: &[Option<String>],
+    elems: &[pg_sys::Datum],
 ) -> bool {
-    let (min, max) = match (&row.min, &row.max) {
-        (Some(min), Some(max)) => (min, max),
-        _ => return false,
+    let Some((min_d, max_d)) = parsed_bounds(row, parse_type) else {
+        return false;
     };
-    let cmpproc = match cmp_proc_cached(typ) {
-        Some(p) => p,
-        None => return false,
-    };
-    let min_d = match parse_cached(typ, min) {
-        Some(d) => d,
-        None => return false,
-    };
-    let max_d = match parse_cached(typ, max) {
-        Some(d) => d,
-        None => return false,
-    };
-    // Prune iff no listed value falls within [min, max]. A conversion failure on any
-    // element is conservative: treat it as "could match" -> KEEP.
-    for elem in elems {
-        let text = match elem {
-            Some(t) => t,
-            None => continue, // NULL element never matches a value
-        };
-        let d = match const_datum_cached(typ, text) {
-            Some(d) => d,
-            None => return false,
-        };
-        if cmp_cached(cmpproc, collation, d, min_d) >= 0
-            && cmp_cached(cmpproc, collation, d, max_d) <= 0
-        {
-            return false; // this value is in range -> KEEP
-        }
-    }
-    true
+    // Prune iff no listed value falls within [min, max].
+    !elems.iter().any(|&d| {
+        cmp_cached(cmpproc, collation, min_d, d) <= 0
+            && cmp_cached(cmpproc, collation, max_d, d) >= 0
+    })
 }
 
 /// `Var && Const`: prune iff the partition's stored extent does not overlap the
-/// constant. The overlap test is delegated to PostgreSQL's own `&&` operator on the
-/// column's type (range types, PostGIS geometry), so it works wherever that operator
-/// is defined. A missing extent or any error is conservative (KEEP).
-unsafe fn eval_overlap(row: &ColSummary, const_text: &str, const_type_name: &str) -> bool {
+/// constant. Every row's value lies within the extent, so if the extent does not overlap
+/// the constant, no row can.
+unsafe fn eval_overlap(
+    row: &ColSummary,
+    parse_type: pg_sys::Oid,
+    opfunc: pg_sys::Oid,
+    collation: pg_sys::Oid,
+    k: pg_sys::Datum,
+    commuted: bool,
+) -> bool {
     let extent = match &row.min {
-        Some(e) => e,
-        None => return false,
+        Some(e) if !row.unbounded => e,
+        _ => return false,
     };
-    let type_name = &row.type_name;
-    if type_name.is_empty() {
+    let Some(ext) = parse_cached(parse_type, extent) else {
         return false;
-    }
-    let sql = format!(
-        "SELECT NOT (CAST({ext} AS {ext_t}) && CAST({k} AS {k_t}))",
-        ext = sql_literal(extent),
-        ext_t = type_name,
-        k = sql_literal(const_text),
-        k_t = const_type_name,
-    );
-    Spi::get_one::<bool>(&sql).ok().flatten().unwrap_or(false)
-}
-
-/// Minimal single-quote escaping for SQL string literals built in the planner hook.
-fn sql_literal(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "''"))
+    };
+    let (a, b) = if commuted { (k, ext) } else { (ext, k) };
+    let overlaps = pg_sys::FunctionCall2Coll(fmgr_cached(opfunc), collation, a, b);
+    overlaps.value() & 0xff == 0
 }
 
 // ---------------------------------------------------------------------------------
@@ -719,22 +735,16 @@ pub(crate) unsafe fn datum_cmp(
     pg_sys::OidFunctionCall2Coll(cmpproc, collation, a, b).value() as i32
 }
 
-/// Default btree "compare" support proc for a type, or `None` if unavailable.
+/// Looked up under the opclass's input type, which may differ from `typ` (varchar -> text).
 pub(crate) unsafe fn btree_cmp_proc(typ: pg_sys::Oid) -> Option<pg_sys::Oid> {
     let opclass = pg_sys::GetDefaultOpClass(typ, pg_sys::BTREE_AM_OID);
     if opclass == pg_sys::Oid::INVALID {
         return None;
     }
     let opfamily = pg_sys::get_opclass_family(opclass);
-    if opfamily == pg_sys::Oid::INVALID {
-        return None;
-    }
-    let proc = pg_sys::get_opfamily_proc(opfamily, typ, typ, BTORDER_PROC as i16);
-    if proc == pg_sys::Oid::INVALID {
-        None
-    } else {
-        Some(proc)
-    }
+    let intype = pg_sys::get_opclass_input_type(opclass);
+    let proc = pg_sys::get_opfamily_proc(opfamily, intype, intype, BTORDER_PROC as i16);
+    (proc != pg_sys::Oid::INVALID).then_some(proc)
 }
 
 /// Convert text to a Datum of `typ` via the type's input function.
@@ -767,19 +777,21 @@ pub(crate) unsafe fn datum_to_text(typ: pg_sys::Oid, datum: pg_sys::Datum) -> Op
     text
 }
 
-/// SQL type name for a type OID (e.g. "geometry", "int4range").
-unsafe fn type_name(typ: pg_sys::Oid) -> Option<String> {
-    let ptr = pg_sys::format_type_be(typ);
-    if ptr.is_null() {
+unsafe fn type_namespace(typ: pg_sys::Oid) -> Option<pg_sys::Oid> {
+    let tup = pg_sys::SearchSysCache1(
+        pg_sys::SysCacheIdentifier::TYPEOID as i32,
+        pg_sys::Datum::from(typ),
+    );
+    if tup.is_null() {
         return None;
     }
-    let name = CStr::from_ptr(ptr).to_str().ok().map(|s| s.to_owned());
-    pg_sys::pfree(ptr as *mut _);
-    name
+    let ns = (*pg_sys::heap_tuple_get_struct::<pg_sys::FormData_pg_type>(tup)).typnamespace;
+    pg_sys::ReleaseSysCache(tup);
+    Some(ns)
 }
 
-/// Decompose a non-null array Const into per-element text values.
-unsafe fn array_const_texts(con: *mut pg_sys::Const) -> Option<Vec<Option<String>>> {
+/// NULL elements are dropped: they never match.
+unsafe fn array_const_datums(con: *mut pg_sys::Const) -> Option<Vec<pg_sys::Datum>> {
     let elem_type = pg_sys::get_element_type((*con).consttype);
     if elem_type == pg_sys::Oid::INVALID {
         return None;
@@ -807,15 +819,12 @@ unsafe fn array_const_texts(con: *mut pg_sys::Const) -> Option<Vec<Option<String
         &mut nelems,
     );
 
-    let mut out = Vec::with_capacity(nelems as usize);
-    for i in 0..nelems as usize {
-        if *nulls.add(i) {
-            out.push(None);
-        } else {
-            out.push(datum_to_text(elem_type, *elems.add(i)));
-        }
-    }
-    Some(out)
+    Some(
+        (0..nelems as usize)
+            .filter(|&i| !*nulls.add(i))
+            .map(|i| *elems.add(i))
+            .collect(),
+    )
 }
 
 unsafe fn strip_relabel(mut node: *mut pg_sys::Node) -> *mut pg_sys::Node {
@@ -829,22 +838,13 @@ unsafe fn is_tag(node: *mut pg_sys::Node, tag: pg_sys::NodeTag) -> bool {
     !node.is_null() && (*node).type_ == tag
 }
 
-/// Map an operator to a btree strategy number (1..5) over `lefttype`'s default family.
-unsafe fn btree_strategy(opno: pg_sys::Oid, lefttype: pg_sys::Oid) -> Option<i16> {
-    let opclass = pg_sys::GetDefaultOpClass(lefttype, pg_sys::BTREE_AM_OID);
+unsafe fn default_btree_family(typ: pg_sys::Oid) -> Option<pg_sys::Oid> {
+    let opclass = pg_sys::GetDefaultOpClass(typ, pg_sys::BTREE_AM_OID);
     if opclass == pg_sys::Oid::INVALID {
         return None;
     }
     let opfamily = pg_sys::get_opclass_family(opclass);
-    if opfamily == pg_sys::Oid::INVALID {
-        return None;
-    }
-    let s = pg_sys::get_op_opfamily_strategy(opno, opfamily);
-    if s == 0 {
-        None
-    } else {
-        Some(s as i16)
-    }
+    (opfamily != pg_sys::Oid::INVALID).then_some(opfamily)
 }
 
 fn commute_strategy(strategy: i16) -> i16 {

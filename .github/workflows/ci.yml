@@ -60,6 +60,15 @@ jobs:
       - name: Run tests
         run: cargo pgrx test ${{ matrix.pg }}
 
+      - name: Run multi-session tests
+        run: |
+          PG_CONFIG="$(cargo pgrx info pg-config ${{ matrix.pg }})"
+          MAJOR="${{ matrix.pg }}"; MAJOR="${MAJOR#pg}"
+          cargo pgrx install --no-default-features --features ${{ matrix.pg }} --pg-config "$PG_CONFIG"
+          cargo pgrx start ${{ matrix.pg }}
+          PATH="$(dirname "$PG_CONFIG"):$PATH" PGHOST=localhost PGPORT=$((28800 + MAJOR)) \
+            tests/multisession.sh
+
   postgis:
     name: postgis (pg16)
     runs-on: ubuntu-latest

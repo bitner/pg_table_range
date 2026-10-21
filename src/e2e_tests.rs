@@ -71,6 +71,34 @@ fn e2e_count_where(pred: &str) -> i64 {
         .expect("count value")
 }
 
+/// Count rows of `table` matching `pred`.
+fn e2e_count_in(table: &str, pred: &str) -> i64 {
+    Spi::get_one::<i64>(&format!("SELECT count(*)::bigint FROM {table} WHERE {pred}"))
+        .expect("count")
+        .expect("count value")
+}
+
+/// Count matching rows with pruning on and off, assert they agree, and return the count.
+fn e2e_same_on_off(table: &str, pred: &str) -> i64 {
+    e2e_set_pruning(false);
+    let off = e2e_count_in(table, pred);
+    e2e_set_pruning(true);
+    let on = e2e_count_in(table, pred);
+    assert_eq!(on, off, "pruning changed results for `{pred}`: on={on} off={off}");
+    on
+}
+
+/// A table `name` LIST-partitioned on `k` into `{name}_1` (k=1) and `{name}_2` (k=2).
+fn e2e_two_partitions(name: &str, columns: &str) {
+    Spi::run(&format!(
+        "DROP TABLE IF EXISTS {name} CASCADE;
+         CREATE TABLE {name} (k int, {columns}) PARTITION BY LIST (k);
+         CREATE TABLE {name}_1 PARTITION OF {name} FOR VALUES IN (1);
+         CREATE TABLE {name}_2 PARTITION OF {name} FOR VALUES IN (2);"
+    ))
+    .expect("create partitioned table");
+}
+
 #[pg_test]
 fn e2e_prunes_lower_partitions_for_high_predicate() {
     e2e_setup_events();
@@ -168,22 +196,22 @@ fn e2e_works_on_plain_unpartitioned_table() {
 }
 
 #[pg_test]
-fn e2e_insert_keeps_results_correct_via_staleness() {
+fn e2e_insert_widens_summary() {
     e2e_setup_events();
     e2e_set_pruning(true);
     // Sanity: before the insert, val=500 prunes everything (no partition covers it).
     assert_eq!(e2e_count_where("val = 500"), 0);
 
-    // Insert a value far outside r1's summarized range. aminsert marks r1 stale, so the
-    // new row is still found — no false negative despite a now-stale summary.
+    // Insert a value far outside r1's summarized range. aminsert widens r1's summary to
+    // cover it, so the new row is found and r1 is kept for it.
     Spi::run("INSERT INTO events VALUES (1, 500)").expect("insert");
     assert_eq!(
         e2e_count_where("val = 500"),
         1,
-        "stale summary must not prune away newly inserted matching rows"
+        "widened summary must cover the newly inserted row"
     );
     let plan = e2e_explain("SELECT * FROM events WHERE val = 500");
-    assert!(plan.contains("events_r1"), "r1 kept while stale:\n{plan}");
+    assert!(plan.contains("events_r1"), "r1 kept after widening:\n{plan}");
 }
 
 #[pg_test]
@@ -562,4 +590,145 @@ fn e2e_is_null_pruning() {
             .unwrap();
         assert_eq!(on, off, "null mismatch for `{pred}`");
     }
+}
+
+#[pg_test(error = "division by zero")]
+fn e2e_planning_error_is_reported_as_error() {
+    // A planning-time ERROR passes through the planner hooks and must not abort the backend.
+    Spi::run("SELECT 1/0").unwrap();
+}
+
+#[pg_test]
+fn e2e_cached_plan_replanned_after_widening() {
+    // PL/pgSQL static SQL uses a cached generic plan, like PREPARE.
+    e2e_two_partitions("cp", "val bigint");
+    Spi::run(
+        "INSERT INTO cp VALUES (1, 1), (2, 100);
+         CREATE INDEX cp_tr ON cp USING table_range (val);
+         CREATE FUNCTION cp_count() RETURNS bigint LANGUAGE plpgsql AS
+           $$ BEGIN RETURN (SELECT count(*) FROM cp WHERE val = 5000); END $$;",
+    )
+    .unwrap();
+    e2e_set_pruning(true);
+    for _ in 0..6 {
+        assert_eq!(Spi::get_one::<i64>("SELECT cp_count()").unwrap(), Some(0));
+    }
+    Spi::run("INSERT INTO cp VALUES (2, 5000)").unwrap();
+    assert_eq!(
+        Spi::get_one::<i64>("SELECT cp_count()").unwrap(),
+        Some(1),
+        "cached plan must be replanned after the summary widens"
+    );
+}
+
+#[pg_test]
+fn e2e_each_widening_visible_later_in_transaction() {
+
+    e2e_two_partitions("sx", "val bigint");
+    Spi::run(
+        "INSERT INTO sx VALUES (1, 1), (2, 100);
+         CREATE INDEX sx_tr ON sx USING table_range (val);",
+    )
+    .unwrap();
+    e2e_set_pruning(true);
+    Spi::run("INSERT INTO sx VALUES (1, 7000)").unwrap();
+    assert_eq!(e2e_count_in("sx", "val = 7000"), 1);
+    Spi::run("INSERT INTO sx VALUES (1, 8000)").unwrap();
+    assert_eq!(e2e_count_in("sx", "val = 8000"), 1);
+}
+
+#[pg_test]
+fn e2e_cross_type_comparisons() {
+    // `f > 100.1::float4` means f > 100.09999847..., not f > 100.1.
+    e2e_two_partitions("xt", "f float8, b bigint");
+    Spi::run(
+        "INSERT INTO xt VALUES (1, 1.0, 1), (1, 100.09999999, 2), (2, 500, 100);
+         CREATE INDEX xt_tr ON xt USING table_range (f, b);",
+    )
+    .unwrap();
+    assert_eq!(e2e_same_on_off("xt", "f > 100.1::float4"), 2);
+    assert_eq!(e2e_same_on_off("xt", "f >= 100.1::float4 AND f < 101"), 1);
+    let plan = e2e_explain_on("xt", "b = 100::int4");
+    assert!(!plan.contains("xt_1"), "int8 = int4 must prune:\n{plan}");
+    let plan = e2e_explain_on("xt", "f > 400::float4");
+    assert!(!plan.contains("xt_1"), "float8 > float4 must prune:\n{plan}");
+}
+
+#[pg_test]
+fn e2e_other_collation_is_not_pruned() {
+
+    let Some(coll) = Spi::get_one::<String>(
+        "SELECT collname::text FROM pg_collation
+         WHERE collname IN ('und-x-icu', 'en_US.utf8', 'en_US.UTF-8', 'en_US')
+           AND collencoding IN (-1, pg_char_to_encoding(current_setting('server_encoding')))
+         ORDER BY collname = 'und-x-icu' DESC LIMIT 1",
+    )
+    .unwrap() else {
+        return; // no linguistic collation in this build
+    };
+    e2e_two_partitions("co", &format!("s text COLLATE \"{coll}\""));
+    Spi::run(
+        "INSERT INTO co VALUES (1, 'apple'), (1, 'Zebra'), (2, 'mango');
+         CREATE INDEX co_tr ON co USING table_range (s);",
+    )
+    .unwrap();
+    // Linguistically 'apple' < 'Zebra'; bytewise 'Zebra' < 'apple'.
+    assert_eq!(e2e_same_on_off("co", "s > 'Zebra' COLLATE \"C\""), 2);
+    let plan = e2e_explain_on("co", "s > 'Zebra' COLLATE \"C\"");
+    assert!(plan.contains("co_1"), "another collation must not prune:\n{plan}");
+    // Under the summary's own collation, 'mango' > 'b'.
+    let plan = e2e_explain_on("co", "s < 'b'");
+    assert!(!plan.contains("co_2"), "the summary's collation must prune:\n{plan}");
+}
+
+#[pg_test]
+fn e2e_bounds_independent_of_session_io_settings() {
+    // Bounds are stored as text, which these session settings would otherwise change.
+    e2e_two_partitions("ss", "d date, f float8");
+    Spi::run(
+        "INSERT INTO ss VALUES (1, '2024-03-05', 1), (2, '2025-01-01', 500);
+         CREATE INDEX ss_tr ON ss USING table_range (d, f);
+         SET DateStyle = 'SQL, DMY';
+         INSERT INTO ss VALUES (1, '01/12/2024', NULL);
+         SET DateStyle = 'ISO, MDY';
+         SET extra_float_digits = -10;
+         INSERT INTO ss VALUES (1, NULL, 123444.4);
+         RESET extra_float_digits;",
+    )
+    .unwrap();
+    assert_eq!(e2e_same_on_off("ss", "d >= '2024-11-01'"), 2);
+    assert_eq!(e2e_same_on_off("ss", "f > 123441 AND f < 200000"), 1);
+    Spi::run("RESET DateStyle").unwrap();
+}
+
+#[pg_test]
+fn e2e_types_without_min_max_aggregates_prune() {
+    // uuid/bool lack min()/max(); varchar/enum compare via text/anyenum procs.
+    Spi::run(
+        "DROP TYPE IF EXISTS e2e_mood CASCADE;
+         CREATE TYPE e2e_mood AS ENUM ('sad', 'ok', 'happy');",
+    )
+    .unwrap();
+    e2e_two_partitions("ty", "u uuid, fl bool, m e2e_mood, v varchar");
+    Spi::run(
+        "INSERT INTO ty VALUES
+           (1, '00000000-0000-0000-0000-000000000001', false, 'sad', 'aa'),
+           (2, 'ffffffff-0000-0000-0000-000000000001', true, 'happy', 'zz');
+         CREATE INDEX ty_tr ON ty USING table_range (u, fl, m, v);",
+    )
+    .unwrap();
+    e2e_set_pruning(true);
+    for pred in [
+        "u = 'ffffffff-0000-0000-0000-000000000001'",
+        "m = 'happy'",
+        "v = 'zz'",
+    ] {
+        let plan = e2e_explain_on("ty", pred);
+        assert!(!plan.contains("ty_1"), "`{pred}` must prune ty_1:\n{plan}");
+        assert_eq!(e2e_same_on_off("ty", pred), 1);
+    }
+    // Widening on insert works for these types too.
+    Spi::run("INSERT INTO ty VALUES (1, NULL, NULL, 'happy', 'zzz')").unwrap();
+    assert_eq!(e2e_same_on_off("ty", "v = 'zzz'"), 1);
+    assert_eq!(e2e_same_on_off("ty", "m = 'happy'"), 2);
 }
