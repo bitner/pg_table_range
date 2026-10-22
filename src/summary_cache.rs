@@ -3,7 +3,9 @@
 // plan. Keyed by index OID; values are shared (`Rc`) with the per-plan cache.
 //
 // Correctness rests on the over-inclusive invariant: a cached summary is safe as long as
-// it is never *narrower* than the real data. Every page write calls `note_changed`.
+// it is never *narrower* than the real data. Every write that can change what the planner
+// prunes with calls `note_changed`; a mid-rebuild page is never pruned with, and CREATE
+// INDEX / REINDEX invalidate the relcache themselves.
 
 use crate::index_storage::ColSummary;
 use pgrx::pg_sys;

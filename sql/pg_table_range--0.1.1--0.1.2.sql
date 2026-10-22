@@ -15,8 +15,8 @@ BEGIN
     IF n > 0 THEN
         -- Extension scripts run with client_min_messages >= WARNING, so a NOTICE would
         -- never reach the user.
-        RAISE WARNING 'pg_table_range: % table_range index(es) must be rebuilt with REINDEX before they prune again', n
-            USING HINT = 'Summaries built by 0.1.1 are ignored by 0.1.2. REINDEX each table_range index (on a partitioned table, REINDEX the parent index).';
+        RAISE WARNING 'pg_table_range: % table_range index(es) must be rebuilt before they prune again', n
+            USING HINT = 'Summaries built by 0.1.1 are not pruned with. REINDEX each table_range index (on a partitioned table, the parent index), or, once updated to 0.2.0 or later, VACUUM the table or run table_range_summarize().';
     END IF;
 END
 $$;

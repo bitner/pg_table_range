@@ -12,7 +12,8 @@ use pgrx::prelude::*;
 // This is not a conventional scannable index: instead of indexing rows, it stores one
 // min/max/null (or extent) summary per indexed column in its own metapage. `ambuild`
 // scans the leaf relation to build it; `aminsert` widens it in place as rows arrive (like
-// BRIN, and needing no MVCC because the summary only has to be over-inclusive). The
+// BRIN, and needing no MVCC because the summary only has to be over-inclusive);
+// `amvacuumcleanup` rebuilds summaries that need it. The
 // planner hook prunes partitions using those summaries. The index is never chosen for
 // scans (no `amgettuple`/`amgetbitmap`, prohibitive cost estimate).
 
@@ -354,8 +355,8 @@ unsafe extern "C-unwind" fn am_bulkdelete(
     stats
 }
 
-/// Rebuilds summaries that are unbounded (e.g. once an oversized value is deleted) or were
-/// left mid-rebuild.
+/// Rebuilds summaries that are unbounded (e.g. once an oversized value is deleted), were
+/// left mid-rebuild, or are in an on-page format this build does not prune with.
 #[pg_guard]
 unsafe extern "C-unwind" fn am_vacuumcleanup(
     info: *mut pg_sys::IndexVacuumInfo,

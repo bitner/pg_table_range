@@ -25,7 +25,7 @@ env:
 jobs:
   debian:
     name: Debian package (PostgreSQL ${{ matrix.pg }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     container: debian:bookworm
     strategy:
       fail-fast: false
@@ -47,7 +47,7 @@ jobs:
           apt-get install -y --no-install-recommends \
             "postgresql-${{ matrix.pg }}" "postgresql-server-dev-${{ matrix.pg }}"
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust (toolchain from rust-toolchain.toml)
         run: |
@@ -55,7 +55,7 @@ jobs:
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -88,7 +88,7 @@ jobs:
         run: bash packaging/build-deb.sh "${{ matrix.pg }}"
 
       - name: Upload .deb artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: deb-pg${{ matrix.pg }}
           path: target/deb/*.deb
@@ -97,15 +97,15 @@ jobs:
   docker:
     name: Docker image (ghcr.io)
     needs: debian
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Download the PostgreSQL 18 .deb
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: deb-pg18
           path: docker-deb
@@ -124,18 +124,18 @@ jobs:
           echo "push=${push}" >> "$GITHUB_OUTPUT"
 
       - name: Set up Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Log in to GHCR
         if: steps.meta.outputs.push == 'true'
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: packaging/Dockerfile
@@ -146,19 +146,19 @@ jobs:
     name: GitHub Release
     needs: debian
     if: github.ref_type == 'tag'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
       - name: Download all .deb artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: deb-pg*
           path: debs
           merge-multiple: true
 
       - name: Create / update the GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: debs/*.deb
           generate_release_notes: true
@@ -167,7 +167,7 @@ jobs:
     name: Release on PGXN
     needs: debian
     if: github.ref_type == 'tag'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Gated on the protected `pgxn` environment: it holds the PGXN_USERNAME / PGXN_PASSWORD
     # secrets, is restricted to v* tags, and requires manual approval before the upload runs.
     environment: pgxn
@@ -176,7 +176,7 @@ jobs:
       PGXN_USERNAME: ${{ secrets.PGXN_USERNAME }}
       PGXN_PASSWORD: ${{ secrets.PGXN_PASSWORD }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Verify META.json version matches the tag
         run: |

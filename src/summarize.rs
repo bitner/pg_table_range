@@ -9,17 +9,17 @@ use crate::index_storage::{self, ColSummary, IndexSummary};
 // shortcut: a rebuild that errors or is cancelled leaves the page summarizing (never
 // pruned) until the next VACUUM or table_range_summarize; clear it on abort if that bites.
 
-/// Returns whether the summary was rebuilt. `only_unbounded` skips summaries whose bounds
-/// are all known, so a routine VACUUM does not rescan the partition.
+/// Returns whether the summary was rebuilt. `only_unbounded` skips readable summaries whose
+/// bounds are all known, so a routine VACUUM does not rescan the partition.
 pub(crate) unsafe fn resummarize(
     index: pg_sys::Relation,
     heap: pg_sys::Relation,
     only_unbounded: bool,
 ) -> bool {
-    if !start_collecting(index, only_unbounded) {
+    let index_info = pg_sys::BuildIndexInfo(index);
+    if !start_collecting(index, index_info, only_unbounded) {
         return false;
     }
-    let index_info = pg_sys::BuildIndexInfo(index);
     let built = crate::summary_build::build_leaf_summary(heap, index, index_info, true);
 
     // Extending geometry extents runs SQL, which needs a snapshot (VACUUM has none).
@@ -53,18 +53,24 @@ pub(crate) unsafe fn resummarize(
 }
 
 /// Swap in empty bounds and the `summarizing` flag; `false` if there is nothing to do.
-unsafe fn start_collecting(index: pg_sys::Relation, only_unbounded: bool) -> bool {
+unsafe fn start_collecting(
+    index: pg_sys::Relation,
+    index_info: *mut pg_sys::IndexInfo,
+    only_unbounded: bool,
+) -> bool {
     loop {
         pgrx::check_for_interrupts!();
         let Some(before) = index_storage::read_blob(index) else {
             return false;
         };
-        let Some(summary) = index_storage::deserialize(&before) else {
-            return false;
+        let summary = match index_storage::deserialize(&before) {
+            Some(s) if only_unbounded && !s.summarizing && !s.cols.iter().any(|c| c.unbounded) => {
+                return false
+            }
+            Some(s) => s,
+            // Unreadable (e.g. an older on-page format, never pruned with): rebuild it.
+            None => crate::summary_build::empty_summary(index, index_info),
         };
-        if only_unbounded && !summary.summarizing && !summary.cols.iter().any(|c| c.unbounded) {
-            return false;
-        }
         let collecting = IndexSummary {
             cols: summary
                 .cols

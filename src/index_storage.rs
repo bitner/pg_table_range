@@ -144,7 +144,8 @@ pub struct IndexSummary {
     pub summarizing: bool,
 }
 
-// Formats older than version 2 are unreadable on purpose: they may not cover their data.
+// Formats older than version 2 are not read on purpose (they may not cover their data);
+// VACUUM and table_range_summarize rebuild them.
 const FORMAT_PLAIN: u8 = 2;
 /// FORMAT_PLAIN plus a header flags byte. Written only while summarizing, so pages stay
 /// readable by binaries that know only FORMAT_PLAIN.

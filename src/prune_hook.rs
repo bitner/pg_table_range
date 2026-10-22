@@ -18,7 +18,7 @@ use crate::{TABLE_RANGE_ENABLE_PRUNING, TABLE_RANGE_LOG_PRUNING_DEBUG};
 // clause proves the partition cannot contain a matching row, we call `mark_dummy_rel`.
 //
 // Each partition's summary is read from its table_range index's metapage and cached for
-// the duration of one top-level planner invocation.
+// the life of the backend (`summary_cache`), with per-plan compiled state on top.
 
 extern "C" {
     fn mark_dummy_rel(rel: *mut pg_sys::RelOptInfo);

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Upgrade test: indexes built by an earlier release keep pruning and widening when this
-# build's library is loaded, both before and after ALTER EXTENSION UPDATE, and the updated
-# extension matches a fresh install. Builds OLD_REF from a git worktree, installs it into
+# Upgrade test: indexes built by an earlier release stay correct when this build's library
+# is loaded, both before and after ALTER EXTENSION UPDATE; VACUUM leaves them all pruning;
+# and the updated extension matches a fresh install. Builds OLD_REF from a git worktree, installs it into
 # the PostgreSQL that PG_CONFIG names, creates a throwaway cluster, then installs this
 # checkout over it and restarts.
 #
@@ -108,6 +108,9 @@ CREATE INDEX t_tr ON t USING table_range ($indexed);
 SQL
 old_version=$(q -d upgraded -c "SELECT extversion FROM pg_extension WHERE extname = 'pg_table_range'")
 echo "built summaries with $old_version (PostGIS: $geo)"
+# 0.1.1's on-page format is never pruned with, until VACUUM or a re-summarize rebuilds it.
+old_scans=1
+[[ "$old_version" == 0.1.1 ]] && old_scans=2
 
 install "$ROOT" "$ROOT/target"
 pg_ctl -D "$DIR/data" -l "$DIR/server.log" restart >/dev/null
@@ -116,11 +119,16 @@ export PGOPTIONS="-c DateStyle=SQL,DMY"
 
 # The new library on the old catalog: what runs between the restart and the update.
 for w in "${in_2[@]}"; do
-    expect "old summary prunes: $w" "$(scans "SELECT * FROM t WHERE $w")" 1
+    expect "old summary: $w" "$(scans "SELECT * FROM t WHERE $w")" "$old_scans"
 done
+q -d upgraded -c "VACUUM t"
+for w in "${in_2[@]}"; do
+    expect "after VACUUM every summary prunes: $w" "$(scans "SELECT * FROM t WHERE $w")" 1
+done
+
 q -d upgraded -c "INSERT INTO t VALUES ($new_row)"
 for w in "${outside[@]}"; do
-    expect "insert widens an old summary: $w" "$(q -d upgraded -c "SELECT count(*) FROM t WHERE $w")" 1
+    expect "insert widens a summary: $w" "$(q -d upgraded -c "SELECT count(*) FROM t WHERE $w")" 1
 done
 
 q -d upgraded -c "ALTER EXTENSION pg_table_range UPDATE"

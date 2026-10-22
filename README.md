@@ -154,7 +154,8 @@ EXPLAIN (COSTS OFF) SELECT * FROM places WHERE geom && ST_MakeEnvelope(0,0,10,10
   existing range writes nothing; one that extends it grows the min/max/extent, as a
   compare-and-swap on the metapage so concurrent inserts never overwrite each other's
   widening. A widening invalidates cached copies of the summary and cached plans on the
-  partition in every backend. If a value cannot be represented (for example it is too
+  partition in every backend and on hot standbys, even if the inserting transaction rolls
+  back. If a value cannot be represented (for example it is too
   large for the metapage), that column becomes *unbounded* — it no longer prunes by
   value, but is never too narrow. Pruning therefore stays correct **and** active across
   inserts without any rebuild. Deletes only shrink a partition's true range, leaving the
@@ -165,7 +166,10 @@ EXPLAIN (COSTS OFF) SELECT * FROM places WHERE geom && ST_MakeEnvelope(0,0,10,10
   blocking inserts (like BRIN summarization). It covers every row version still in the
   table, so it re-tightens bounds once `VACUUM` has removed deleted rows. `VACUUM` itself
   rebuilds any summary with an unbounded column (e.g. once an oversized value has been
-  deleted) or one left mid-rebuild. `REINDEX` also rebuilds summaries, but blocks writes.
+  deleted), one left mid-rebuild, or one in an on-page format it does not prune with.
+  `REINDEX` also rebuilds summaries, but blocks writes. On a hot standby a narrowed summary
+  never hides a row a standby query can still see: either `hot_standby_feedback` keeps the
+  row, or the query is cancelled by the usual recovery conflict.
 
 ## Performance
 
@@ -249,14 +253,15 @@ avoids everything `CHECK` constraints make you give up:
 
 | | Time | WAL |
 |---|---|---|
-| no index | ~45–52 ms | 7.9 MB |
-| table_range, values inside the summary's bounds | ~88 ms | 7.9 MB |
-| table_range, ascending values (every row widens the summary) | ~280 ms | 13.3 MB |
+| no index | ~51–57 ms | 7.9 MB |
+| table_range, values inside the summary's bounds | ~92 ms | 7.9 MB |
+| table_range, ascending values (every row widens the summary) | ~311 ms | 20.7 MB |
 
 Within a statement each partition's summary is decoded once, so a row inside the bounds
 costs a page read and a comparison (~0.4 µs) and writes nothing. For PostGIS geometry the
 comparison is a bounding-box containment check (~4 µs per covered row). A row that widens the
-summary costs ~2.3 µs and ~55 bytes of WAL. Every transaction that widens a summary also
+summary costs ~2.5 µs and ~130 bytes of WAL: the changed bytes (~55) plus a record that
+tells hot standbys to drop their cached copy. Every transaction that widens a summary also
 invalidates cached plans on that partition (see [Limitations](#limitations)).
 
 ## Scaling and partition count
@@ -345,12 +350,13 @@ requires owning the table and, like `VACUUM`, runs index expressions as the tabl
 ## Storage
 
 There is no catalog table — each partition's summary lives on its `table_range` index's
-metapage (block 0), written by `ambuild` and updated in place by `aminsert`, like BRIN.
+metapage (block 0), written by `ambuild`, widened in place by `aminsert`, and rebuilt by
+`table_range_summarize` and `VACUUM`, like BRIN.
 Bounds are stored as each type's text form, written and read with the type I/O settings
 that affect it (`DateStyle`, `IntervalStyle`, `extra_float_digits`) pinned to
 round-trip-exact values. The on-page format is versioned: format 2, or format 3 (format 2
 plus a header flag) while a rebuild is in progress. A summary in any other format is never
-used for pruning until `REINDEX` rebuilds it.
+used for pruning until `VACUUM`, `table_range_summarize` or `REINDEX` rebuilds it.
 
 ## Project layout
 
@@ -358,16 +364,17 @@ used for pruning until `REINDEX` rebuilds it.
 |------|----------------|
 | `src/lib.rs` | GUCs, `_PG_init`, test wiring |
 | `src/index_storage.rs` | per-index summary on the metapage: page I/O (Generic WAL) + (de)serialization |
-| `src/summary_build.rs` | build a leaf's summary by scanning its data (used by `ambuild`) |
+| `src/summary_build.rs` | build a leaf's summary by scanning its data (used by `ambuild` and re-summarizing) |
 | `src/prune_hook.rs` | planner + pathlist hooks, per-plan compilation cache, typed in-memory evaluation |
 | `src/summarize.rs` | rebuilds summaries (VACUUM, `table_range_summarize`) without blocking inserts |
 | `src/summary_cache.rs` | backend-lifetime per-index summary cache + relcache-invalidation coherence |
 | `src/stable_io.rs` | pins the GUCs that change a type's text form while summaries are written or read |
-| `src/index_am.rs` | `table_range` index AM: build, incremental `aminsert` widening, opclass provisioning |
+| `src/index_am.rs` | `table_range` index AM: build, incremental `aminsert` widening, `amvacuumcleanup` rebuilds, opclass provisioning |
+| `src/insert_cache.rs` | the summary decoded once per statement, so inserts it already covers write nothing |
 | `src/e2e_tests.rs`, `src/index_am_tests.rs` | end-to-end tests |
 | `tests/multisession.sh` | tests that need several concurrent backends (run against a live server) |
 | `tests/standby.sh` | summary changes reaching queries on a hot standby (creates its own primary and standby) |
-| `tests/upgrade.sh` | `ALTER EXTENSION UPDATE` from the previous release (builds it from its git tag) |
+| `tests/upgrade.sh` | `ALTER EXTENSION UPDATE` from an earlier release (builds it from its git tag) |
 | `sql/` | extension upgrade scripts |
 
 ## Building and testing
@@ -382,10 +389,10 @@ PGHOST=localhost PGPORT=28818 tests/multisession.sh
 
 # hot standby and upgrade tests, each on its own throwaway cluster
 PATH="$(dirname "$(cargo pgrx info pg-config pg18)"):$PATH" tests/standby.sh
-tests/upgrade.sh "$(cargo pgrx info pg-config pg18)"
+tests/upgrade.sh "$(cargo pgrx info pg-config pg18)" v0.1.2   # or v0.1.1
 ```
 
-Supported targets: PostgreSQL 16, 17, 18. The test suite is entirely end-to-end —
+Supported targets: PostgreSQL 16, 17, 18. The `#[pg_test]` suite is end-to-end —
 it builds real partitioned tables, asserts `EXPLAIN` shows the expected partition
 elimination, and verifies results are identical with pruning on and off (the
 no-false-negative guarantee), including insert/delete/drop correctness paths. The
@@ -422,7 +429,7 @@ To cut a release:
    git tag v0.1.0 && git push origin v0.1.0
    ```
 
-`META.json` describes the PGXN distribution; `PLAN.md` and `.github/` are excluded from
+`META.json` describes the PGXN distribution; `.github/` is excluded from
 the published tarball via `.gitattributes`.
 
 ## Limitations

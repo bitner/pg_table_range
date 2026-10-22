@@ -5,7 +5,8 @@ use pgrx::prelude::*;
 use pgrx::PgMemoryContexts;
 use std::ffi::{CStr, CString};
 
-// Index-build scan, not SQL: it sees recently-dead tuples and works during REINDEX.
+// Table AM scans, not SQL: the index-build scan for CREATE INDEX / REINDEX, or a scan of
+// every row version when re-summarizing.
 
 /// `heap_tuples` becomes the heap's `reltuples` via `index_build`.
 pub(crate) struct LeafBuild {
@@ -100,6 +101,21 @@ pub(crate) unsafe fn build_leaf_summary(
         summary,
         heap_tuples,
     }
+}
+
+/// The summary of a leaf with no rows: the index's columns, with no bounds.
+pub(crate) unsafe fn empty_summary(
+    index: pg_sys::Relation,
+    index_info: *mut pg_sys::IndexInfo,
+) -> IndexSummary {
+    let build_cxt = PgMemoryContexts::new("table_range build");
+    let cxt = build_cxt.value();
+    let mut state = BuildState {
+        cols: PgMemoryContexts::For(cxt).switch_to(|_| plan_columns(index, index_info)),
+        cxt,
+    };
+    crate::stable_io::with_stable_io(|| finish(&mut state))
+        .unwrap_or_else(|| error!("table_range: cannot build a summary in parallel mode"))
 }
 
 unsafe fn plan_columns(

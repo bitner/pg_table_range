@@ -155,10 +155,10 @@ INSERT INTO bench_d SELECT 1, g, '2024-06-01' FROM generate_series(1, 100000) g;
 DROP TABLE bench_d, bench_d_plain CASCADE;
 
 -- ====================================================================================
--- 5. (Optional) The lock-table wall. At ~10,000 partitions a non-key predicate exhausts
---    the lock table on default settings:
+-- 5. (Optional) The lock-table wall. At a few thousand partitions (once 2 x partitions
+--    exceeds ~6,400 locks) a non-key predicate exhausts the lock table on default settings:
 --      ERROR: out of shared memory
 --      HINT:  You might need to increase "max_locks_per_transaction".
---    Raise max_locks_per_transaction (e.g. to 4000) and restart to push the wall out.
+--    Raise max_locks_per_transaction (e.g. to 4096) and restart to push the wall out.
 --    Native key pruning is unaffected because it never locks pruned partitions.
 -- ====================================================================================

@@ -160,6 +160,32 @@ fn am_summarize_narrows_to_the_data() {
 }
 
 #[pg_test]
+fn am_summarize_rebuilds_unreadable_summary() {
+    am_setup();
+    Spi::run("CREATE INDEX amt_tr ON amt USING table_range (val)").unwrap();
+    // On-page format 1 (never pruned with), claiming val in [0, 0].
+    Spi::run(&format!(
+        "SELECT table_range_test_write_blob({}, '\\x010100020000000400696e74380101003001010030')",
+        am_leaf_index("amt_1")
+    ))
+    .unwrap();
+    assert!(am_explain("amt", "val = -500").contains("on amt_1"));
+    let rebuilt = Spi::get_one::<i32>("SELECT table_range_summarize('amt_tr'::regclass)")
+        .unwrap()
+        .unwrap();
+    assert_eq!(rebuilt, 3, "every leaf is rebuilt");
+    let summary = am_leaf_summary("amt_1");
+    assert!(
+        summary.contains("summarizing=false")
+            && summary.contains("min=Some(\"0\")")
+            && summary.contains("max=Some(\"99\")"),
+        "{summary}"
+    );
+    assert!(!am_explain("amt", "val = -500").contains("on amt_1"));
+    assert_eq!(e2e_same_on_off("amt", "val BETWEEN 0 AND 99"), 100);
+}
+
+#[pg_test]
 fn am_summarize_keeps_column_unbounded_while_value_exists() {
     e2e_two_partitions("ub", "s text, n bigint");
     Spi::run(
@@ -401,10 +427,10 @@ fn am_unknown_summary_format_is_ignored() {
          CREATE INDEX fmt_tr ON fmt USING table_range (val);",
     )
     .unwrap();
-    // version 1 | ncols=1 | attnum=1 | overlap=0 | flags=0 | "int8" | min "0" | max "0"
+    // version 4 | ncols=1 | attnum=1 | overlap=0 | flags=0 | "int8" | min "0" | max "0"
     Spi::run(
         "SELECT table_range_test_write_blob('fmt_tr'::regclass::oid,
-           '\\x010100010000000400696e74380101003001010030')",
+           '\\x040100010000000400696e74380101003001010030')",
     )
     .unwrap();
     assert_eq!(e2e_same_on_off("fmt", "val = 5"), 1);
