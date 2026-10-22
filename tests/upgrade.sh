@@ -28,7 +28,7 @@ trap cleanup EXIT
 
 install() {
     # A target dir per source tree, so neither build invalidates the other's cache.
-    (cd "$1" && CARGO_TARGET_DIR="$2" cargo pgrx install --release \
+    (cd "$1" && CARGO_TARGET_DIR="$2" cargo pgrx install \
         --no-default-features --features "pg$MAJOR" --pg-config "$PG_CONFIG" >"$DIR/install.log" 2>&1) \
         || { tail -n 30 "$DIR/install.log"; exit 1; }
 }
@@ -51,7 +51,13 @@ scans() { q -d upgraded -c "EXPLAIN (COSTS OFF) $1" | grep -c "Scan on" || true;
 # What the extension consists of, to compare an updated install with a fresh one.
 members() {
     q -d "$1" <<'SQL'
-SELECT pg_describe_object(classid, objid, 0) || coalesce(' ' || pg_get_functiondef(objid), '')
+-- Operator classes are named after type oids, which differ between databases.
+SELECT regexp_replace(pg_describe_object(classid, objid, 0), 'tr_[0-9]+', 'tr_')
+    || coalesce(' ' || (SELECT opcintype::regtype::text FROM pg_opclass
+                        WHERE classid = 'pg_opclass'::regclass AND oid = objid), '')
+    || coalesce(' ' || (SELECT string_agg(opcintype::regtype::text, ',') FROM pg_opclass
+                        WHERE classid = 'pg_opfamily'::regclass AND opcfamily = objid), '')
+    || coalesce(' ' || pg_get_functiondef(objid), '')
 FROM pg_depend
 WHERE refclassid = 'pg_extension'::regclass
   AND refobjid = (SELECT oid FROM pg_extension WHERE extname = 'pg_table_range')
@@ -73,30 +79,56 @@ EOF
 pg_ctl -D "$DIR/data" -l "$DIR/server.log" start >/dev/null
 
 q -d postgres -c "CREATE DATABASE upgraded"
-q -d upgraded <<'SQL'
+# One column per kind of summary; geometry only where PostGIS is installed.
+geo=$(q -d postgres -c "SELECT count(*) FROM pg_available_extensions WHERE name = 'postgis'")
+cols="x int, s text, ts timestamptz, r int4range"
+row="g, 'p' || lpad(g::text, 5, '0'), '2024-01-01'::timestamptz + g * interval '1 day', int4range(g, g + 10)"
+indexed="x, s, ts, r"
+# Values only in partition 2, and values in neither partition (the widening row).
+in_2=("x = 1050" "s = 'p01050'" "ts = '2026-11-16'" "r && int4range(1050, 1051)")
+outside=("x = 5000" "s = 'zz'" "ts = '2040-01-01'" "r && int4range(5000, 5001)")
+new_row="1, 5000, 'zz', '2040-01-01', int4range(5000, 5001)"
+if ((geo > 0)); then
+    q -d upgraded -c "CREATE EXTENSION postgis"
+    cols+=", g geometry"
+    row+=", ST_MakePoint(g, g)"
+    indexed+=", g"
+    in_2+=("g && ST_MakeEnvelope(1049, 1049, 1051, 1051)")
+    outside+=("g && ST_MakeEnvelope(4999, 4999, 5001, 5001)")
+    new_row+=", ST_MakePoint(5000, 5000)"
+fi
+q -d upgraded <<SQL
 CREATE EXTENSION pg_table_range;
-CREATE TABLE t (k int, x int) PARTITION BY LIST (k);
+CREATE TABLE t (k int, $cols) PARTITION BY LIST (k);
 CREATE TABLE t_1 PARTITION OF t FOR VALUES IN (1);
 CREATE TABLE t_2 PARTITION OF t FOR VALUES IN (2);
-INSERT INTO t SELECT 1, g FROM generate_series(0, 99) g;
-INSERT INTO t SELECT 2, g FROM generate_series(1000, 1099) g;
-CREATE INDEX t_tr ON t USING table_range (x);
+INSERT INTO t SELECT 1, $row FROM generate_series(0, 99) g;
+INSERT INTO t SELECT 2, $row FROM generate_series(1000, 1099) g;
+CREATE INDEX t_tr ON t USING table_range ($indexed);
 SQL
 old_version=$(q -d upgraded -c "SELECT extversion FROM pg_extension WHERE extname = 'pg_table_range'")
-echo "built summaries with $old_version"
+echo "built summaries with $old_version (PostGIS: $geo)"
 
 install "$ROOT" "$ROOT/target"
 pg_ctl -D "$DIR/data" -l "$DIR/server.log" restart >/dev/null
+# Read the old text bounds under a different date format than they were written in.
+export PGOPTIONS="-c DateStyle=SQL,DMY"
 
 # The new library on the old catalog: what runs between the restart and the update.
-expect "old summary prunes with the new library" "$(scans "SELECT * FROM t WHERE x = 50")" 1
-q -d upgraded -c "INSERT INTO t VALUES (1, 5000)"
-expect "insert widens an old summary" "$(q -d upgraded -c "SELECT count(*) FROM t WHERE x = 5000")" 1
+for w in "${in_2[@]}"; do
+    expect "old summary prunes: $w" "$(scans "SELECT * FROM t WHERE $w")" 1
+done
+q -d upgraded -c "INSERT INTO t VALUES ($new_row)"
+for w in "${outside[@]}"; do
+    expect "insert widens an old summary: $w" "$(q -d upgraded -c "SELECT count(*) FROM t WHERE $w")" 1
+done
 
 q -d upgraded -c "ALTER EXTENSION pg_table_range UPDATE"
 expect "updated to the default version" \
     "$(q -d upgraded -c "SELECT extversion = default_version FROM pg_extension, pg_available_extensions WHERE extname = name AND name = 'pg_table_range'")" t
 q -d postgres -c "CREATE DATABASE fresh"
+# Same types available, since the extension creates an operator class for each.
+((geo > 0)) && q -d fresh -c "CREATE EXTENSION postgis"
 q -d fresh -c "CREATE EXTENSION pg_table_range"
 if diff <(members upgraded) <(members fresh); then
     echo "ok   updated extension matches a fresh install"
@@ -109,8 +141,12 @@ fi
 q -d upgraded -c "DELETE FROM t WHERE x = 5000" -c "VACUUM t"
 expect "summarize rebuilds every old summary" \
     "$(q -d upgraded -c "SELECT table_range_summarize('t_tr'::regclass)")" 2
-expect "rebuilt summary prunes the deleted value" "$(scans "SELECT * FROM t WHERE x = 5000")" 0
-expect "rebuilt summary keeps the data" "$(scans "SELECT * FROM t WHERE x = 1050")" 1
+for w in "${outside[@]}"; do
+    expect "rebuilt summary prunes the deleted value: $w" "$(scans "SELECT * FROM t WHERE $w")" 0
+done
+for w in "${in_2[@]}"; do
+    expect "rebuilt summary keeps the data: $w" "$(scans "SELECT * FROM t WHERE $w")" 1
+done
 
 if ((failures > 0)); then
     tail -n 20 "$DIR/server.log"

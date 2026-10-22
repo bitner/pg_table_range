@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Hot standby tests: summary changes on a primary must reach queries on a streaming
 # standby. Creates a throwaway primary and standby in a temporary directory, using the
-# PostgreSQL binaries on PATH (with the extension installed).
+# PostgreSQL binaries on PATH (with the extension installed). HOT_STANDBY_FEEDBACK=on runs
+# the standby with feedback.
 #
 #     PATH="$(dirname "$(cargo pgrx info pg-config pg18)"):$PATH" tests/standby.sh
 
@@ -10,6 +11,8 @@ set -euo pipefail
 DIR=$(mktemp -d "${TMPDIR:-/tmp}/trsb.XXXXXX")
 PRIMARY_PORT=${PRIMARY_PORT:-54401}
 STANDBY_PORT=${STANDBY_PORT:-54402}
+# With feedback on, the primary keeps rows a standby query still sees.
+FEEDBACK=${HOT_STANDBY_FEEDBACK:-off}
 failures=0
 
 cleanup() {
@@ -36,8 +39,9 @@ p -c "CREATE EXTENSION pg_table_range"
 pg_basebackup -h "$DIR" -p "$PRIMARY_PORT" -U postgres -D "$DIR/standby" -R -X stream
 cat >>"$DIR/standby/postgresql.conf" <<EOF
 port = $STANDBY_PORT
-hot_standby_feedback = off
+hot_standby_feedback = $FEEDBACK
 max_standby_streaming_delay = 0
+wal_receiver_status_interval = 1
 EOF
 pg_ctl -D "$DIR/standby" -l "$DIR/standby.log" start >/dev/null
 
@@ -104,6 +108,13 @@ wait "${READER_PID:-}" || true
 coproc OLD { "${PSQL[@]}" -p "$STANDBY_PORT" -v ON_ERROR_STOP=0; }
 printf '%s\n' "BEGIN ISOLATION LEVEL REPEATABLE READ;" "SELECT count(*) FROM t WHERE x = 600;" >&"${OLD[1]}"
 read -r -t 10 -u "${OLD[0]}" _
+if [[ "$FEEDBACK" == on ]]; then
+    # Feedback is periodic: wait until the primary holds rows back for the standby.
+    for _ in $(seq 100); do
+        [[ $(p -c "SELECT count(backend_xmin) FROM pg_stat_replication") == 1 ]] && break
+        sleep 0.1
+    done
+fi
 # Deleting the top of the range (500 and 600) is what lets a rebuild narrow the bounds.
 p -c "DELETE FROM t WHERE x > 100" -c "SELECT table_range_summarize('t_tr'::regclass)" >/dev/null
 caught_up
@@ -111,23 +122,33 @@ echo "SELECT count(*) FROM t WHERE x = 600;" >&"${OLD[1]}"
 read -r -t 10 -u "${OLD[0]}" seen || seen=none
 expect "standby snapshot keeps a deleted row across re-summarizing" "$seen" 1
 
-# 4. Once VACUUM removes the row, the old standby snapshot is cancelled by the recovery
-#    conflict before the narrowed summary is replayed; it never silently loses the row.
+# 4. Without feedback, VACUUM removes the row and the old standby snapshot is cancelled by
+#    the recovery conflict before the narrowed summary is replayed. With feedback, the row
+#    stays, and so must the bounds that cover it. Either way the row is never lost.
 p -c "VACUUM t" -c "SELECT table_range_summarize('t_tr'::regclass)" >/dev/null
 caught_up
 { echo "SELECT count(*) FROM t WHERE x = 600;" >&"${OLD[1]}"; } 2>/dev/null || true
 read -r -t 10 -u "${OLD[0]}" seen || seen=cancelled
-if [[ "$seen" == 1 || "$seen" == cancelled ]]; then
+if [[ "$seen" == 1 || ("$seen" == cancelled && "$FEEDBACK" == off) ]]; then
     echo "ok   after VACUUM the standby snapshot sees the row or is cancelled ($seen)"
 else
-    echo "FAIL after VACUUM the standby snapshot got $seen rows"
+    echo "FAIL after VACUUM the standby snapshot got: $seen"
     failures=$((failures + 1))
 fi
 # The coprocess may already be gone (terminated by the recovery conflict).
 [[ -n "${OLD[1]:-}" ]] && exec {OLD[1]}>&-
 wait "${OLD_PID:-}" 2>/dev/null || true
-expect "narrowed summary prunes on the standby" \
-    "$(s -c "EXPLAIN (COSTS OFF) SELECT * FROM t WHERE x = 600" | grep -c "Scan on" || true)" 0
+
+# 5. Once no standby query needs the row (with feedback, once the primary hears so), a
+#    rebuild narrows the bounds there too.
+for _ in $(seq 30); do
+    p -c "VACUUM t" -c "SELECT table_range_summarize('t_tr'::regclass)" >/dev/null
+    caught_up
+    scanned=$(s -c "EXPLAIN (COSTS OFF) SELECT * FROM t WHERE x = 600" | grep -c "Scan on" || true)
+    ((scanned == 0)) && break
+    sleep 1
+done
+expect "narrowed summary prunes on the standby" "$scanned" 0
 
 if ((failures > 0)); then
     tail -n 20 "$DIR/standby.log"
