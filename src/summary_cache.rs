@@ -45,8 +45,12 @@ pub unsafe fn note_changed(indexoid: pg_sys::Oid, heapoid: pg_sys::Oid) {
             relId: relid,
         },
     };
-    let messages = [message(indexoid), message(heapoid)];
+    let mut messages = [message(indexoid), message(heapoid)];
     pg_sys::SendSharedInvalidMessages(messages.as_ptr(), messages.len() as i32);
+    // Hot standbys only see invalidations that are in the WAL.
+    if pg_sys::wal_level >= pg_sys::WalLevel::WAL_LEVEL_REPLICA as i32 {
+        pg_sys::LogStandbyInvalidations(messages.len() as i32, messages.as_mut_ptr(), false);
+    }
 }
 
 /// Relcache invalidation callback: drop the cached summary for `relid` (or all of them

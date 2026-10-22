@@ -456,3 +456,82 @@ fn am_one_statement_keeps_exact_bounds() {
         e2e_same_on_off("os", pred);
     }
 }
+
+#[pg_test]
+fn am_updates_widen_summary() {
+    am_setup();
+    Spi::run(
+        "CREATE INDEX amt_tr ON amt USING table_range (val);
+         ALTER TABLE amt ADD COLUMN note text;
+         ALTER TABLE amt ALTER COLUMN note SET STORAGE EXTERNAL;",
+    )
+    .unwrap();
+    // In place (can be HOT: a summarizing index does not block it).
+    Spi::run("UPDATE amt SET val = 5000 WHERE val = 7").unwrap();
+    assert_eq!(e2e_same_on_off("amt", "val = 5000"), 1);
+    assert!(am_explain("amt", "val = 5000").contains("on amt_1"));
+    assert!(!am_explain("amt", "val = 6000").contains("on amt_1"));
+    // Moving a row to another partition inserts it there.
+    Spi::run("UPDATE amt SET region = 3, val = -5000 WHERE val = 8").unwrap();
+    assert_eq!(e2e_same_on_off("amt", "val = -5000"), 1);
+    assert!(am_explain("amt", "val = -5000").contains("on amt_3"));
+    // An update of another column carries an out-of-line indexed value along unchanged.
+    Spi::run(
+        "UPDATE amt SET note = repeat(md5(val::text), 94) WHERE region = 2;
+         UPDATE amt SET created = created + 1 WHERE region = 2;",
+    )
+    .unwrap();
+    assert_eq!(e2e_same_on_off("amt", "val BETWEEN 100 AND 199"), 100);
+}
+
+#[pg_test(error = "table_range: must be owner of table \"amt_1\"")]
+fn am_summarize_requires_ownership() {
+    am_setup();
+    Spi::run("CREATE INDEX amt_tr ON amt USING table_range (val); CREATE ROLE tr_not_owner;")
+        .unwrap();
+    let index = Spi::get_one::<pg_sys::Oid>("SELECT 'amt_tr'::regclass::oid")
+        .unwrap()
+        .unwrap();
+    Spi::run(&format!(
+        "SET ROLE tr_not_owner; SELECT table_range_summarize({}::oid);",
+        u32::from(index)
+    ))
+    .unwrap();
+}
+
+#[pg_test(error = "table_range: \"amt_btree\" is not a table_range index")]
+fn am_summarize_rejects_other_index_types() {
+    am_setup();
+    Spi::run(
+        "CREATE INDEX amt_btree ON amt_1 (val);
+         SELECT table_range_summarize('amt_btree'::regclass);",
+    )
+    .unwrap();
+}
+
+#[pg_test(error = "table_range: \"amt_1\" is not an index")]
+fn am_summarize_rejects_tables() {
+    am_setup();
+    Spi::run("SELECT table_range_summarize('amt_1'::regclass)").unwrap();
+}
+
+#[pg_test]
+fn am_summarize_covers_every_level_of_partitioning() {
+    Spi::run(
+        "DROP TABLE IF EXISTS ml CASCADE;
+         CREATE TABLE ml (a int, b int, v bigint) PARTITION BY LIST (a);
+         CREATE TABLE ml_1 PARTITION OF ml FOR VALUES IN (1) PARTITION BY LIST (b);
+         CREATE TABLE ml_1_1 PARTITION OF ml_1 FOR VALUES IN (1);
+         CREATE TABLE ml_1_2 PARTITION OF ml_1 FOR VALUES IN (2);
+         CREATE TABLE ml_2 PARTITION OF ml FOR VALUES IN (2);
+         INSERT INTO ml VALUES (1, 1, 10), (1, 2, 20), (2, 1, 30);
+         CREATE INDEX ml_tr ON ml USING table_range (v);",
+    )
+    .unwrap();
+    let rebuilt = Spi::get_one::<i32>("SELECT table_range_summarize('ml_tr'::regclass)")
+        .unwrap()
+        .unwrap();
+    assert_eq!(rebuilt, 3, "the three leaves, at both levels");
+    let plan = am_explain("ml", "v = 20");
+    assert!(plan.contains("on ml_1_2") && !plan.contains("on ml_1_1") && !plan.contains("on ml_2"));
+}

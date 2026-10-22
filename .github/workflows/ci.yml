@@ -19,6 +19,8 @@ jobs:
         pg: [pg16, pg17, pg18]
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # the upgrade test builds the previous release tag
 
       - name: Install build dependencies
         run: |
@@ -68,6 +70,13 @@ jobs:
           cargo pgrx start ${{ matrix.pg }}
           PATH="$(dirname "$PG_CONFIG"):$PATH" PGHOST=localhost PGPORT=$((28800 + MAJOR)) \
             tests/multisession.sh
+
+      - name: Run hot standby tests
+        run: PATH="$(dirname "$(cargo pgrx info pg-config ${{ matrix.pg }})"):$PATH" tests/standby.sh
+
+      - name: Run upgrade test (pg18 only)
+        if: matrix.pg == 'pg18'
+        run: tests/upgrade.sh "$(cargo pgrx info pg-config pg18)"
 
   postgis:
     name: postgis (pg16)

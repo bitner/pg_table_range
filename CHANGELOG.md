@@ -19,8 +19,8 @@ that is being rebuilt, and would skip maintaining it), then run
 - Fixed: an insert that widened a summary and then rolled back left the summary widened
   without telling other backends. A later insert of a value in that range then changed
   nothing, so other backends could keep pruning with their cached summary and miss the
-  committed row. This also affected 0.1.2. Widening now notifies other backends
-  immediately.
+  committed row. This also affected 0.1.2. Widening now notifies other backends, and
+  hot standbys, immediately.
 - A column can no longer appear twice in a table_range index (e.g. under two
   collations); both would have shared one summary.
 - Summaries are written in on-page format 2 as before, and in format 3 (with a header

@@ -167,6 +167,7 @@ unsafe fn widen_on_insert(
             return;
         }
         // Changed by another backend since we read it: decode the new page and retry.
+        pgrx::debug1!("table_range: summary changed concurrently, retrying");
         insert_cache::forget(slot);
     }
 }

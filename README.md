@@ -366,6 +366,8 @@ used for pruning until `REINDEX` rebuilds it.
 | `src/index_am.rs` | `table_range` index AM: build, incremental `aminsert` widening, opclass provisioning |
 | `src/e2e_tests.rs`, `src/index_am_tests.rs` | end-to-end tests |
 | `tests/multisession.sh` | tests that need several concurrent backends (run against a live server) |
+| `tests/standby.sh` | summary changes reaching queries on a hot standby (creates its own primary and standby) |
+| `tests/upgrade.sh` | `ALTER EXTENSION UPDATE` from the previous release (builds it from its git tag) |
 | `sql/` | extension upgrade scripts |
 
 ## Building and testing
@@ -377,6 +379,10 @@ cargo pgrx run  pg18      # open psql with the extension installed
 # multi-backend tests, against a running server with the extension installed
 cargo pgrx install && cargo pgrx start pg18
 PGHOST=localhost PGPORT=28818 tests/multisession.sh
+
+# hot standby and upgrade tests, each on its own throwaway cluster
+PATH="$(dirname "$(cargo pgrx info pg-config pg18)"):$PATH" tests/standby.sh
+tests/upgrade.sh "$(cargo pgrx info pg-config pg18)"
 ```
 
 Supported targets: PostgreSQL 16, 17, 18. The test suite is entirely end-to-end —
@@ -439,8 +445,8 @@ the published tarball via `.gitattributes`.
   `REINDEX`, re-tightens it) — always correct, just potentially less selective.
 - A `table_range_summarize` that errors or is cancelled leaves the summary marked
   mid-rebuild, so that partition is not pruned until the next `VACUUM` or
-  `table_range_summarize`. `VACUUM (PARALLEL …)` skips rebuilding summaries; run
-  `table_range_summarize` instead.
+  `table_range_summarize`. `VACUUM (PARALLEL …)` and `VACUUM (INDEX_CLEANUP OFF)` skip
+  rebuilding summaries; run `table_range_summarize` instead.
 - A column can appear only once in a table_range index.
 - Every transaction that widens a summary invalidates cached plans on that partition in
   every backend (a widening's WAL is small, but plans are replanned). Append-only

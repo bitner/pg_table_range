@@ -98,22 +98,31 @@ INSERT INTO cc VALUES (1, '[0,1)');
 CREATE INDEX cc_tr ON cc USING table_range (r);
 SQL
 pids=()
+retries=$(mktemp)
 for i in 1 2 3; do
-    q -c "INSERT INTO cc VALUES (1, '[$((i * 100)),$((i * 100 + 1)))')" &
-    pids+=($!)
-    q -c "INSERT INTO cc VALUES (1, '[-$((i * 100)),-$((i * 100 - 1)))')" &
-    pids+=($!)
+    for v in "[$((i * 100)),$((i * 100 + 1)))" "[-$((i * 100)),-$((i * 100 - 1)))"; do
+        q -c "SET client_min_messages = debug1" -c "INSERT INTO cc VALUES (1, '$v')" 2>>"$retries" &
+        pids+=($!)
+    done
 done
 wait "${pids[@]}"
 for v in 100 -100 200 -200 300 -300; do
     check "concurrent widening to $v kept" "cc WHERE r && '[$v,$((v + 1)))'::slowrange"
 done
+if grep -q "summary changed concurrently" "$retries"; then
+    echo "ok   the writers raced (at least one compare-and-swap retried)"
+else
+    echo "FAIL the writers never raced, so the race was not tested"
+    failures=$((failures + 1))
+fi
+rm -f "$retries"
 
 # Assert how many partitions a query scans with pruning on.
 expect_scans() {
     local label=$1 from_where=$2 want=$3 got
     got=$(q -c "SET table_range.enable_pruning = on" \
-        -c "EXPLAIN (COSTS OFF) SELECT * FROM $from_where" | grep -c "Scan on" || true)
+        -c "EXPLAIN (COSTS OFF) SELECT * FROM $from_where" |
+        grep "Scan on" | grep -vc "Bitmap Index Scan" || true)
     if [[ "$got" == "$want" ]]; then
         echo "ok   $label (scans $got)"
     else
@@ -243,6 +252,31 @@ else
     echo "FAIL rolled-back widening: other backend rows=$seen, want 1"
     failures=$((failures + 1))
 fi
+
+# 8. VACUUM rebuilds an unbounded summary only when it runs index cleanup outside parallel
+#    mode: VACUUM (PARALLEL n) and INDEX_CLEANUP OFF leave it for a later VACUUM or
+#    table_range_summarize. Two btree indexes make VACUUM (PARALLEL 2) actually parallel.
+q <<'SQL'
+CREATE TABLE pv (k int, n bigint, s text) PARTITION BY LIST (k);
+CREATE TABLE pv_1 PARTITION OF pv FOR VALUES IN (1) WITH (autovacuum_enabled = false);
+INSERT INTO pv SELECT 1, g, 'm' FROM generate_series(1, 20000) g;
+CREATE INDEX pv_n ON pv_1 (n);
+CREATE INDEX pv_s ON pv_1 (s);
+CREATE INDEX pv_tr ON pv USING table_range (s);
+INSERT INTO pv VALUES (1, 0, 'z' || repeat('x', 9000));
+DELETE FROM pv WHERE length(s) > 100;
+SQL
+verbose=$(q -c "SET min_parallel_index_scan_size = 0" -c "VACUUM (PARALLEL 2, VERBOSE) pv" 2>&1)
+if grep -q "parallel vacuum worker" <<<"$verbose"; then
+    expect_scans "VACUUM (PARALLEL 2) leaves the summary unbounded" "pv WHERE s = 'zz'" 1
+else
+    echo "FAIL VACUUM (PARALLEL 2) did not run in parallel, so the case was not tested"
+    failures=$((failures + 1))
+fi
+q -c "VACUUM (INDEX_CLEANUP OFF) pv"
+expect_scans "VACUUM (INDEX_CLEANUP OFF) leaves the summary unbounded" "pv WHERE s = 'zz'" 1
+q -c "VACUUM pv"
+expect_scans "a non-parallel VACUUM rebuilds it" "pv WHERE s = 'zz'" 0
 
 if ((failures > 0)); then
     echo "$failures multi-session check(s) failed"

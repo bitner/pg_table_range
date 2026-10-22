@@ -372,6 +372,9 @@ fn e2e_postgis_inserts_keep_exact_extent() {
     let plan = e2e_explain_on("gd", "g && ST_MakeEnvelope(60, 60, 61, 61)");
     assert!(!plan.contains("on gd_1"), "{plan}");
 
+    // Re-summarizing computes the extent from every row again (ST_Extent over batches).
+    Spi::run("SELECT table_range_summarize('gi_tr'::regclass)").unwrap();
+
     // The data's extent ends at x = 2977.
     let plan = e2e_explain_on("gi", "g && ST_MakeEnvelope(2976.5, 0, 2977, 1)");
     assert!(plan.contains("on gi_1"), "a box at the edge keeps gi_1:\n{plan}");
