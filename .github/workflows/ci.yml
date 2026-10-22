@@ -87,6 +87,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # the upgrade test builds the previous release tag
 
       - name: Install PostgreSQL 16 + PostGIS + build deps
         run: |
@@ -123,6 +125,9 @@ jobs:
 
       - name: Run tests (PostGIS available -> geometry test runs for real)
         run: cargo pgrx test pg16
+
+      - name: Run upgrade test (with PostGIS)
+        run: tests/upgrade.sh /usr/lib/postgresql/16/bin/pg_config
 
   fmt:
     name: rustfmt
