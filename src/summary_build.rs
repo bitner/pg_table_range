@@ -379,7 +379,7 @@ unsafe fn type_name_parts(typ: pg_sys::Oid) -> Option<(String, String)> {
     if tup.is_null() {
         return None;
     }
-    let form = pg_sys::heap_tuple_get_struct::<pg_sys::FormData_pg_type>(tup);
+    let form = pg_sys::GETSTRUCT!(tup).get().cast::<pg_sys::FormData_pg_type>();
     let name = CStr::from_ptr((*form).typname.data.as_ptr())
         .to_string_lossy()
         .into_owned();

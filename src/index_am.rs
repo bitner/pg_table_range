@@ -116,7 +116,7 @@ unsafe fn widen_on_insert(
     isnull: *mut bool,
 ) {
     loop {
-        pgrx::check_for_interrupts!();
+        pgrx::check_for_interrupts();
         // No summary, or an unreadable one: the planner never prunes with it.
         let Some(before) = index_storage::read_blob(index) else {
             return;
@@ -171,11 +171,11 @@ unsafe fn widen_summary(
 /// PG18 made `TupleDescAttr` an inline function (bound by pgrx) and moved attributes to
 /// `compact_attrs` (which has no `atttypid`); PG13–17 expose `attrs` directly and only a
 /// `TupleDescAttr` macro (which bindgen does not surface as `pg_sys::TupleDescAttr`).
-#[cfg(feature = "pg18")]
+#[cfg(any(feature = "pg18", feature = "pg19"))]
 pub(crate) unsafe fn att_typid(tupdesc: pg_sys::TupleDesc, i: usize) -> pg_sys::Oid {
     (*pg_sys::TupleDescAttr(tupdesc, i as i32)).atttypid
 }
-#[cfg(not(feature = "pg18"))]
+#[cfg(not(any(feature = "pg18", feature = "pg19")))]
 pub(crate) unsafe fn att_typid(tupdesc: pg_sys::TupleDesc, i: usize) -> pg_sys::Oid {
     let natts = (*tupdesc).natts as usize;
     (*tupdesc).attrs.as_slice(natts)[i].atttypid

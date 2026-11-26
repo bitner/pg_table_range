@@ -7,7 +7,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  PGRX_VERSION: "0.18.1"
+  PGRX_VERSION: "0.20.1"
 
 jobs:
   test:
@@ -16,7 +16,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        pg: [pg16, pg17, pg18]
+        pg: [pg16, pg17, pg18, pg19]
     steps:
       - uses: actions/checkout@v4
 
