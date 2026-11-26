@@ -2,7 +2,7 @@
 # for compatibility with PGXS-style tooling (e.g. `pgxn install`). This is NOT a real PGXS
 # build — it shells out to cargo-pgrx, which must be installed:
 #
-#     cargo install cargo-pgrx --version 0.18.1 --locked
+#     cargo install cargo-pgrx --version 0.20.1 --locked
 #
 # Usage:
 #     make                                              # build for the PostgreSQL PG_CONFIG finds
@@ -10,7 +10,7 @@
 #     make PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config install
 #
 # The PostgreSQL major version is detected from PG_CONFIG and mapped to the matching pgrx
-# feature (pg16/pg17/pg18).
+# feature (pg16/pg17/pg18/pg19).
 
 PG_CONFIG ?= pg_config
 PG_MAJOR  := $(shell $(PG_CONFIG) --version | sed -E 's/[^0-9]*([0-9]+).*/\1/')

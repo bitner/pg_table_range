@@ -181,12 +181,37 @@ pub fn install() {
 }
 
 // `#[pg_guard]`: planner ERRORs reach Rust as panics, which must not unwind into C.
+#[cfg(not(feature = "pg19"))]
 #[pg_guard]
 unsafe extern "C-unwind" fn table_range_planner_hook(
     parse: *mut pg_sys::Query,
     query_string: *const std::ffi::c_char,
     cursor_options: i32,
     bound_params: pg_sys::ParamListInfo,
+) -> *mut pg_sys::PlannedStmt {
+    with_plan_cache(|| match PREV_PLANNER_HOOK {
+        Some(prev) => prev(parse, query_string, cursor_options, bound_params),
+        None => pg_sys::standard_planner(parse, query_string, cursor_options, bound_params),
+    })
+}
+
+#[cfg(feature = "pg19")]
+#[pg_guard]
+unsafe extern "C-unwind" fn table_range_planner_hook(
+    parse: *mut pg_sys::Query,
+    query_string: *const std::ffi::c_char,
+    cursor_options: i32,
+    bound_params: pg_sys::ParamListInfo,
+    explain: *mut pg_sys::ExplainState,
+) -> *mut pg_sys::PlannedStmt {
+    with_plan_cache(|| match PREV_PLANNER_HOOK {
+        Some(prev) => prev(parse, query_string, cursor_options, bound_params, explain),
+        None => pg_sys::standard_planner(parse, query_string, cursor_options, bound_params, explain),
+    })
+}
+
+fn with_plan_cache(
+    plan: impl FnOnce() -> *mut pg_sys::PlannedStmt + std::panic::UnwindSafe,
 ) -> *mut pg_sys::PlannedStmt {
     // Invalidate the cache when entering the outermost planner invocation.
     let outermost = PLAN_DEPTH.with(|d| {
@@ -199,10 +224,7 @@ unsafe extern "C-unwind" fn table_range_planner_hook(
     }
 
     // Per-plan state points into planner memory: reset it even when planning errors.
-    pgrx::PgTryBuilder::new(|| match PREV_PLANNER_HOOK {
-        Some(prev) => prev(parse, query_string, cursor_options, bound_params),
-        None => pg_sys::standard_planner(parse, query_string, cursor_options, bound_params),
-    })
+    pgrx::PgTryBuilder::new(plan)
     .finally(|| {
         let last = PLAN_DEPTH.with(|d| {
             let v = d.get().saturating_sub(1);
@@ -785,7 +807,7 @@ unsafe fn type_namespace(typ: pg_sys::Oid) -> Option<pg_sys::Oid> {
     if tup.is_null() {
         return None;
     }
-    let ns = (*pg_sys::heap_tuple_get_struct::<pg_sys::FormData_pg_type>(tup)).typnamespace;
+    let ns = (*pg_sys::GETSTRUCT!(tup).get().cast::<pg_sys::FormData_pg_type>()).typnamespace;
     pg_sys::ReleaseSysCache(tup);
     Some(ns)
 }

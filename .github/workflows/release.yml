@@ -1,7 +1,7 @@
 name: Release
 
 # Builds release artifacts and publishes them when a version tag (v*) is pushed:
-#   * debian   - .deb packages for PostgreSQL 16/17/18 (Debian bookworm / PGDG)
+#   * debian   - .deb packages for PostgreSQL 16/17/18/19 (Debian bookworm / PGDG)
 #   * docker   - ghcr.io image: PostgreSQL 18 + PostGIS + pg_table_range
 #   * github-release - attaches the .deb files to the GitHub Release (tags only)
 #   * pgxn     - bundles the source and uploads it to https://pgxn.org (tags only)
@@ -20,7 +20,7 @@ on:
   workflow_dispatch:
 
 env:
-  PGRX_VERSION: "0.18.1"
+  PGRX_VERSION: "0.20.1"
 
 jobs:
   debian:
@@ -30,7 +30,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        pg: ["16", "17", "18"]
+        pg: ["16", "17", "18", "19"]
     steps:
       - name: Install build dependencies and PGDG PostgreSQL ${{ matrix.pg }}
         run: |

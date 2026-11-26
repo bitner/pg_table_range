@@ -66,7 +66,7 @@ pub unsafe fn write_blob(index: pg_sys::Relation, data: &[u8]) -> Result<(), &'s
     } else {
         pg_sys::ReadBuffer(index, 0)
     };
-    pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_EXCLUSIVE as i32);
+    pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_EXCLUSIVE as _);
     put_blob(index, buffer, is_new, data);
     pg_sys::UnlockReleaseBuffer(buffer);
     Ok(())
@@ -86,7 +86,7 @@ pub unsafe fn replace_blob_if(
         return Ok(false);
     }
     let buffer = pg_sys::ReadBuffer(index, 0);
-    pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_EXCLUSIVE as i32);
+    pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_EXCLUSIVE as _);
     let current = page_blob(pg_sys::BufferGetPage(buffer));
     let matches = current.as_deref() == Some(expected);
     if matches {
@@ -103,7 +103,7 @@ pub unsafe fn read_blob(index: pg_sys::Relation) -> Option<Vec<u8>> {
         return None;
     }
     let buffer = pg_sys::ReadBuffer(index, 0);
-    pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_SHARE as i32);
+    pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_SHARE as _);
     let result = page_blob(pg_sys::BufferGetPage(buffer));
     pg_sys::UnlockReleaseBuffer(buffer);
     result

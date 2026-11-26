@@ -32,7 +32,7 @@ without it.
 ## Installation
 
 This is a [pgrx](https://github.com/pgcentralfoundation/pgrx) (Rust) extension. Supported:
-PostgreSQL **16, 17, 18**. Pick whichever route fits; after installing, run
+PostgreSQL **16, 17, 18, 19**. Pick whichever route fits; after installing, run
 `CREATE EXTENSION pg_table_range;` in each database that should use it.
 
 ### Docker (PostgreSQL 18 + PostGIS, batteries included)
@@ -56,12 +56,12 @@ sudo apt install ./postgresql-18-pg-table-range_<version>-1_amd64.deb
 
 ### From source with cargo-pgrx
 
-Requires a Rust toolchain and `cargo-pgrx` matching the pinned pgrx version (**0.18.1**).
+Requires a Rust toolchain and `cargo-pgrx` matching the pinned pgrx version (**0.20.1**).
 The bundled `Makefile` wraps cargo-pgrx (it writes a minimal pgrx `config.toml` for you, so
 no `cargo pgrx init`/`initdb` is needed):
 
 ```sh
-cargo install cargo-pgrx --version 0.18.1 --locked
+cargo install cargo-pgrx --version 0.20.1 --locked
 make install PG_CONFIG=/usr/lib/postgresql/18/bin/pg_config   # major auto-detected from pg_config
 ```
 
@@ -351,7 +351,7 @@ cargo pgrx install && cargo pgrx start pg18
 PGHOST=localhost PGPORT=28818 tests/multisession.sh
 ```
 
-Supported targets: PostgreSQL 16, 17, 18. The test suite is entirely end-to-end —
+Supported targets: PostgreSQL 16, 17, 18, 19. The test suite is entirely end-to-end —
 it builds real partitioned tables, asserts `EXPLAIN` shows the expected partition
 elimination, and verifies results are identical with pruning on and off (the
 no-false-negative guarantee), including insert/delete/drop correctness paths. The
@@ -365,7 +365,7 @@ range-type tests, which exercise the same code path.
 
 | Job | Output |
 |-----|--------|
-| `debian` | `.deb` packages for PostgreSQL 16/17/18 (Debian bookworm / PGDG), built in a `debian:bookworm` container with `packaging/build-deb.sh` |
+| `debian` | `.deb` packages for PostgreSQL 16/17/18/19 (Debian bookworm / PGDG), built in a `debian:bookworm` container with `packaging/build-deb.sh` |
 | `docker` | `ghcr.io/<owner>/pg_table_range:18`, `:vX.Y.Z`, `:latest` (PostgreSQL 18 + PostGIS + the extension) |
 | `github-release` | attaches the `.deb`s to the GitHub Release |
 | `pgxn` | validates `META.json`, bundles the source, and uploads it to [PGXN](https://pgxn.org) |
